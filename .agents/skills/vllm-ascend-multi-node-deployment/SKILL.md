@@ -32,7 +32,12 @@ Skill 按多机公共规则和对应部署说明生成，不由 Provider 提供�
    顺序、清理和报告规则均以 common.md 为准，前一阶段失败时停止。
 3. **模式专属规则**：并行策略、配置参数、启动命令、启动后检查和验收策略等模式
    专属规则按第 1 步选定的模式文档执行。
-4. **结果交还**：服务成功后，`service.url`、模型身份和公共入口交还 Provider；
+4. **在线监控初始化**：服务验收达到 `ready` 后，按
+   [monitor-manifest.md](references/monitor-manifest.md) 将已确认的节点、角色、容器、端口、
+   设备、原始启动参数、依赖、恢复命令和备用节点写入部署目录的
+   `monitor-manifest.json`；将 `scripts/` 中监控运行所需的固定脚本复制到部署控制宿主机，
+   启动 `start_fault_monitor.sh`。监控进程独立于 Pi 会话运行，不调用 Agent 或 LLM。
+5. **结果交还**：服务成功后，`service.url`、模型身份、公共入口和正式停止命令交还 Provider；
    部分启动、rank 不完整、Proxy 不可用或清理失败必须分别报告，最终状态按
    common.md 第 4 节报告 `ready`、`failed` 或 `partially_started`。
 
@@ -60,3 +65,6 @@ Skill 按多机公共规则和对应部署说明生成，不由 Provider 提供�
   启动与验证。
 - [multi-node PD-disaggregated deployment](references/multi-node-PD-disaggregated-deployment.md)：
   Prefill/Decode、KV Transfer 和 Proxy。
+- [故障检测与恢复设计](references/vllm-inference-fault-recovery-design.md)：在线监控进程、
+  确定性故障规则和恢复范围。
+- [监控清单](references/monitor-manifest.md)：监控进程启动所需的结构化运行输入。
