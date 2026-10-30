@@ -60,3 +60,23 @@ Skill 按多机公共规则和对应部署说明生成，不由 Provider 提供�
   启动与验证。
 - [multi-node PD-disaggregated deployment](references/multi-node-PD-disaggregated-deployment.md)：
   Prefill/Decode、KV Transfer 和 Proxy。
+
+## 故障检测和恢复
+
+部署首次验收通过后，继续执行以下初始化：
+
+1. 生成或更新 monitor-manifest.json，包含 deployment_key、control_host、本机 agent_notify endpoint、探测周期，以及每个服务的节点、容器、recovery_group、必填的容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；端口、设备、挂载、环境变量和完整启动命令继续记录在 deployment_report.json 与 commands.log；
+2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；
+3. 在部署控制宿主机注册并启动本次部署的 systemd 监控单元，运行 scripts/vllm_fault_monitor.py；
+4. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
+5. 监控进程通过 HTTP 向 Pi Extension 的 /v1/fault-events 上报事件。
+
+故障事件到达当前 Pi 后，读取并遵守：
+
+- references/monitor-manifest.md：监控清单契约；
+- references/fault-recovery.md：故障检测与恢复流程。
+
+Agent 负责重新检查证据、判断故障类型、选择恢复范围、执行 SSH/Docker 恢复并完成真实验收。监控进程不执行恢复动作。
+
+用户要求停止服务时，先停止对应的 systemd 监控单元并验证当前 PID/PGID、启动时间和命令身份，再按逆依赖顺序通过 SSH 停止服务。
+
