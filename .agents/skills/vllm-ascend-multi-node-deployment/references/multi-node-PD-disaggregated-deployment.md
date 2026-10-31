@@ -51,14 +51,14 @@ Decode 运行在其他节点（单机部署时 P/D 同节点）；agent 所在�
 
 ### 1.2 模型 → connector 映射
 
-下表是 connector 选择的唯一依据；P/D 拓扑（DP/TP/节点数）按第 2 节计算。量化规则见第 5 节参数表。
+下表是未指定 connector 时的默认推荐映射；用户明确指定 connector 时，可以按用户要求指定。
 
 | connector | 模型权重 |
 |---|---|
 | `MooncakeConnectorV1` | DeepSeek-V3 / V3.1、DeepSeek-V3.2、GLM-5、GLM-5.1、GLM-5.2（A3）、Kimi-K2.6、MiniMax-M2、MiniMax-M2.5、Qwen3-235B-A22B、Qwen3-VL-235B、Qwen3.5-397B-A17B、Qwen3.5-27B、Qwen3.6-27B、Qwen2.5-VL-7B（单机 1P1D） |
 | `MooncakeHybridConnector` | DeepSeek-V4-Pro、DeepSeek-V4-Flash |
 | `MooncakeLayerwiseConnector` | DeepSeek-V3.1-Terminus |
-| `MultiConnector` = `MooncakeConnectorV1` + `AscendStoreConnector(backend=mooncake)` | GLM-5.2（8×Atlas 800 A2） |
+| `MultiConnector`  | GLM-5.2（8×Atlas 800 A2）= `MooncakeConnectorV1` + `AscendStoreConnector(backend=mooncake)` |
 
 ### 1.3 connector 选择规则
 
@@ -75,7 +75,7 @@ Decode 运行在其他节点（单机部署时 P/D 同节点）；agent 所在�
 |---|---|
 | “普通 P/D”“先跑通 P 到 D” | 按 1.2 表选择 |
 | “layerwise”“逐层传输” | `MooncakeLayerwiseConnector` |
-| “需要 Mooncake KV Pool”“前缀 KV 复用并使用 Mooncake” | `MultiConnector` = `MooncakeConnectorV1` + `AscendStoreConnector(backend=mooncake)` |
+| “需要 Mooncake KV Pool”“前缀 KV 复用并使用 Mooncake” | `MultiConnector`，子 connector 按用户指定或默认推荐组合填写 |
 
 只有带 `AscendStoreConnector` 的组合才是 KV Pool。connector 名称包含 Mooncake 不等于需要
 KV Pool，不能因此自动增加 `AscendStoreConnector`、Mooncake Master、`mooncake.json`
@@ -155,7 +155,7 @@ Prefill 和 Decode 使用相同的通信环境变量结构，实际值按所在�
   "kv_connector_extra_config": {
     "connectors": [
       {
-        "kv_connector": "MooncakeConnectorV1",
+        "kv_connector": "<selected_connector>",
         "kv_role": "<same_role>",
         "kv_port": "<role_kv_port>",
         "kv_connector_extra_config": {
@@ -183,9 +183,8 @@ Prefill 和 Decode 使用相同的通信环境变量结构，实际值按所在�
 }
 ```
 
-- 子 connector 的 `kv_role` 与外层一致；`MooncakeConnectorV1` 负责实时 KV 传输，
-  `AscendStoreConnector` 负责前缀 KV 池；`lookup_rpc_port` 是 `AscendStoreConnector`
-  的内部 RPC 端口，P 侧填 `"0"`，D 侧填 `"1"`。
+- 子 connector 的 `kv_role` 与外层一致。用户可以将实时 P/D 传输 connector 与`AscendStoreConnector` 组合，例如 `MooncakeHybridConnector` + `AscendStoreConnector`、`MooncakeConnectorV1` + `AscendStoreConnector`；
+  <selected_connector>字段按用户指定的或默认组合填写。
 
 ### 4.3 Mooncake 传输引擎与 KV Pool 服务
 
@@ -224,8 +223,8 @@ Prefill 和 Decode 使用相同的通信环境变量结构，实际值按所在�
 必须在执行前替换，不能原样发送给 Docker。Mooncake Master 和 Proxy 容器不继承模型
 服务外壳，只加 `--network host`。
 
-P/D 模板的 env 唯一例外是池化组合（`MultiConnector` = V1 +
-`AscendStoreConnector(backend=mooncake)`）：其 P/D 容器在 env 块后追加
+P/D 模板的 env 唯一例外是 `MultiConnector` 包含
+`AscendStoreConnector(backend=mooncake)` 的池化组合：其 P/D 容器在 env 块后追加
 `--env PYTHONHASHSEED=0` 和 `--env MOONCAKE_CONFIG_PATH=<容器内路径>`，并把
 `mooncake.json` 只读挂载到该路径（见 4.3）。
 
@@ -347,8 +346,7 @@ docker run --detach \
 
 ### 5.4 Proxy
 
-v0.26 官方提供两个 Proxy 脚本，内置在镜像
-`/workspace/vllm-ascend/examples/disaggregated_prefill_v1/`，
+v0.26 官方提供两个 Proxy 脚本（位于 vllm-ascend 仓库 `examples/disaggregated_prefill_v1/`），
 参数结构完全相同，**请求路由方向不同**，必须按选定 connector 选择：
 
 | connector | Proxy 脚本 | 路由行为 |
@@ -361,7 +359,8 @@ docker run --detach \
   --name proxy-<node-name> \
   --network host \
   --env http_proxy= --env https_proxy= \
-  <proxy_image> bash -lc 'exec python /workspace/vllm-ascend/examples/disaggregated_prefill_v1/<proxy_script> \
+  <proxy_script_mount_if_needed> \
+  <proxy_image> bash -lc 'exec python <proxy_script> \
     --host <proxy_host> \
     --port <proxy_port> \
     --prefiller-hosts <prefill_backend_hosts> \
@@ -370,7 +369,8 @@ docker run --detach \
     --decoder-ports <decode_backend_ports>'
 ```
 
-- `<proxy_script>` 按上表选择；
+- `<proxy_script>` 按上表选择；镜像已内置脚本时 `<proxy_script_mount_if_needed>` 为空，
+  脚本在宿主机时才以只读方式挂载；
 - Proxy 官方指南默认部署在 Prefill 节点，也可用任何能访问全部 P/D 后端的节点；启动前
   必须清空 `http_proxy` / `https_proxy` 环境变量，避免请求转发经过外部代理；
 

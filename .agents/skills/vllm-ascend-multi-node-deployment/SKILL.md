@@ -65,11 +65,13 @@ Skill 按多机公共规则和对应部署说明生成，不由 Provider 提供�
 
 部署首次验收通过后，继续执行以下初始化：
 
-1. 生成或更新 monitor-manifest.json，包含 deployment_key、control_host、本机 agent_notify endpoint、探测周期，以及每个服务的节点、容器、recovery_group、必填的容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；端口、设备、挂载、环境变量和完整启动命令继续记录在 deployment_report.json 与 commands.log；
+1. 生成或更新 monitor-manifest.json，包含 deployment_key、control_host、本机 agent_notify endpoint、探测周期，以及每个服务的节点、容器、recovery_group、基于实机进程身份生成的必填容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；端口、设备、挂载、环境变量和完整启动命令继续记录在 deployment_report.json 与 commands.log；
 2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；
-3. 在部署控制宿主机注册并启动本次部署的 systemd 监控单元，运行 scripts/vllm_fault_monitor.py；
-4. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
-5. 监控进程通过 HTTP 向 Pi Extension 的 /v1/fault-events 上报事件。
+3. 调用Pi Extension的健康检查接口确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功；确认失败时停止流程，不得启动监控单元；
+4. 将 `scripts/vllm_fault_monitor.py` 复制到控制宿主机的 `/data/boom/deployment/vllm_fault_monitor.py`，并设置为可执行；
+5. 只有路由确认成功且脚本复制完成后，才能注册并启动本次部署的 systemd 监控单元；
+6. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
+7. 监控进程通过 HTTP 向 Pi Extension 的 /v1/fault-events 上报事件。
 
 故障事件到达当前 Pi 后，读取并遵守：
 

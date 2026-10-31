@@ -47,7 +47,7 @@
 
 ### 2.1 常驻监控进程和异常退出保护
 
-故障检测由部署控制宿主机上的常驻监控进程持续执行。它在首次部署验收完成后启动，在服务运行期间保持运行。部署验收通过后，Agent 按 SKILL.md 的执行流程注册宿主机进程管理器单元并启动监控进程；监控进程启动后自行将 monitor_pid、monitor_pgid、process_start_time、命令摘要、deployment_key 和清单路径写入 monitor-state.json，Agent 只读取和校验这些字段。
+故障检测由部署控制宿主机上的常驻监控进程持续执行。它在首次部署验收完成后启动，在服务运行期间保持运行。部署验收通过后，Agent 先登记 deployment_key 并确认 Pi Extension `/health` 已返回该 key，再按 SKILL.md 的执行流程注册并启动宿主机进程管理器单元；监控进程启动后自行将 monitor_pid、monitor_pgid、process_start_time、命令摘要、deployment_key 和清单路径写入 monitor-state.json，Agent 只读取和校验这些字段。
 
 监控进程由宿主机的 systemd 或等效进程管理器托管：
 
@@ -85,6 +85,8 @@
 容器退出、Docker 运行时错误、进程消失、SSH 不可达和 NPU 异常等硬信号单次确认即可上报；readiness、日志、业务探针和容器健康状态等软信号需要连续三次探测失败后才上报，期间恢复则清零。单个事件只保留有限数量的最新证据，并记录被丢弃的旧证据数量。
 
 监控进程不判断最终故障类型，也不执行恢复动作。事件必须先写入临时文件，再通过原子改名发布；检测进程重启后继续处理仍处于待处理状态的事件。
+
+Agent 开始恢复前必须先将主故障事件置为 `processing`。恢复期间，依赖该服务或恢复组的服务如果只有 readiness、日志、业务探针或容器健康等软信号，监控只记录证据，不新建事件或重复通知 Agent；主事件恢复后再重新检查依赖服务。依赖服务出现容器退出、SSH 不可达或 NPU 异常等硬信号时，仍可单独生成事件。
 
 ## 3. 故障事件传递给当前 Pi Agent
 
@@ -135,7 +137,7 @@ deployment-20261029-001
 }
 ~~~
 
-Pi Extension 将 deployment_key 关联到当前 Pi 会话。检测部分上报事件时只携带 deployment_key，不需要知道 Pi 的进程 ID、窗口或内部对象。
+Pi Extension 将 deployment_key 关联到当前 Pi 会话。Agent 必须先通过 `/health` 确认该 key 已登记，再启动监控进程。检测部分上报事件时只携带 deployment_key，不需要知道 Pi 的进程 ID、窗口或内部对象。
 
 事件通知包含：
 
@@ -212,7 +214,7 @@ Agent 可以根据实际日志和镜像行为调整恢复顺序，不受固定�
 | 故障类型 | 检测信号和确认条件 | 默认恢复范围和策略 | 典型自动恢复时间 | 升级条件 |
 |---|---|---|---|---|
 | 进程退出 | 容器仍在运行但预期 vLLM 进程不存在；PID 启动时间和命令身份不匹配 | 单进程：使用原命令在原容器、原节点恢复进程 | 30 秒–5 分钟，另加实际模型加载时间 | 进程反复退出、容器环境损坏或原地恢复失败，升级为容器重建 |
-| 容器退出或 OOM | docker inspect 状态为 exited、OOM 或非零退出；日志包含启动失败或 OOM | 容器：在原节点按原镜像、挂载、设备和命令重建 | 1–10 分钟，另加实际模型加载时间 | 达到重试上限、Docker/运行时异常或设备不可用，升级为节点迁移 |
+| 容器退出或 OOM | 容器状态为 exited、OOM 或非零退出；日志包含启动失败或 OOM | 先在原节点启动仍存在且身份未变化的容器并完成进程、readiness、通信和业务验收；启动失败、再次退出、OOM 或配置不可信时，再按原镜像、挂载、设备和命令重建容器 | 1–10 分钟，另加实际模型加载时间 | 达到重试上限、Docker/运行时异常或设备不可用，升级为节点迁移 |
 | readiness 丢失 | API、RPC、控制端口连续不可用；进程仍存在 | 单服务或容器：先隔离入口，再重启或重建对应服务 | 30 秒–5 分钟 | 端口恢复但真实请求仍失败，按进程组或角色组重建 |
 | 业务请求失败或卡死 | 清单配置的最小业务探针连续失败；真实用户流量失败由 Agent 结合日志、网关统计和真实 completion 复核 | 使用 readiness、端口、进程状态和受控的最小业务探针连续确认服务异常后，按原命令重启对应进程或容器，保持原拓扑；不重放用户原始请求 | 1–10 分钟，包含确认和验收时间 | 采样仍无 CPU、NPU、显存和网络进展，升级为角色组重建 |
 | 分布式 rank 失效 | rank 数量不完整、通信端口断开、HCCL/TP/DP 错误；只有当前 vLLM-Ascend 版本、镜像和并行模式明确支持安全重加入时，才允许单 rank 恢复 | 默认按角色组恢复：普通多机重建 Master 和全部 Worker，PD 分离重建受影响的 Prefill 或 Decode 组；不能只确认单个 rank 重新运行或端口恢复 | 5–20 分钟，另加实际模型加载时间 | 组重建失败或承载该组的节点故障时，使用备用节点按原拓扑重建受影响通信组；健康节点保持不变，必须通过完整通信检查和真实 completion 才能报告成功 |
@@ -315,12 +317,17 @@ SKILL.md 是多机部署与故障检测恢复的统一入口，负责模式选�
 - vllm-fault-events.ts：负责 HTTP 接收和 pi.sendMessage，不执行恢复；
 - common.md、multi-node-deployment.md 和 multi-node-PD-disaggregated-deployment.md：保留多机部署公共规则和部署模式说明。
 
+部署完成后，Agent 通过 SSH 将 `scripts/vllm_fault_monitor.py` 复制到控制宿主机的
+`/data/boom/deployment/scripts/vllm_fault_monitor.py`，systemd 使用这个运行时副本启动监控。
+
 ### 7.2. 故障记录和状态
 
 运行数据放在部署目录中：
 
 ~~~text
 /data/boom/deployment/
+├── scripts/
+│   └── vllm_fault_monitor.py
 ├── deployment_report.json
 ├── commands.log
 ├── monitor-manifest.json
