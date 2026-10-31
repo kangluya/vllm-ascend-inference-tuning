@@ -347,8 +347,7 @@ docker run --detach \
 
 ### 5.4 Proxy
 
-v0.26 官方提供两个 Proxy 脚本，内置在镜像
-`/workspace/vllm-ascend/examples/disaggregated_prefill_v1/`，
+v0.26 官方提供两个 Proxy 脚本（位于 vllm-ascend 仓库 `examples/disaggregated_prefill_v1/`），
 参数结构完全相同，**请求路由方向不同**，必须按选定 connector 选择：
 
 | connector | Proxy 脚本 | 路由行为 |
@@ -361,7 +360,8 @@ docker run --detach \
   --name proxy-<node-name> \
   --network host \
   --env http_proxy= --env https_proxy= \
-  <proxy_image> bash -lc 'exec python /workspace/vllm-ascend/examples/disaggregated_prefill_v1/<proxy_script> \
+  <proxy_script_mount_if_needed> \
+  <proxy_image> bash -lc 'exec python <proxy_script> \
     --host <proxy_host> \
     --port <proxy_port> \
     --prefiller-hosts <prefill_backend_hosts> \
@@ -370,7 +370,8 @@ docker run --detach \
     --decoder-ports <decode_backend_ports>'
 ```
 
-- `<proxy_script>` 按上表选择；
+- `<proxy_script>` 按上表选择；镜像已内置脚本时 `<proxy_script_mount_if_needed>` 为空，
+  脚本在宿主机时才以只读方式挂载；
 - Proxy 官方指南默认部署在 Prefill 节点，也可用任何能访问全部 P/D 后端的节点；启动前
   必须清空 `http_proxy` / `https_proxy` 环境变量，避免请求转发经过外部代理；
 
