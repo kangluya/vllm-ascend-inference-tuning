@@ -321,6 +321,7 @@ def append_incident_evidence(
     signals: Sequence[str],
     confirmation_count: int = 1,
     first_failed_at: str | None = None,
+    suppressed_by: str | None = None,
 ) -> None:
     incident = read_json(path, {})
     if not isinstance(incident, dict):
@@ -329,18 +330,32 @@ def append_incident_evidence(
     affected = incident.setdefault("affected_services", [])
     if isinstance(affected, list) and service_id not in affected:
         affected.append(service_id)
-    existing_signals = incident.setdefault("signals", [])
-    if isinstance(existing_signals, list):
-        incident["signals"] = sorted(set(existing_signals).union(signals))
+    if suppressed_by is None:
+        existing_signals = incident.setdefault("signals", [])
+        if isinstance(existing_signals, list):
+            incident["signals"] = sorted(set(existing_signals).union(signals))
+    else:
+        suppressed_signals = incident.setdefault("suppressed_signals", {})
+        if isinstance(suppressed_signals, dict):
+            for signal in signals:
+                suppressed_signals[signal] = int(suppressed_signals.get(signal, 0) or 0) + 1
     existing_evidence = incident.setdefault("evidence", [])
     if isinstance(existing_evidence, list):
+        evidence_kind = "suppressed_dependency" if suppressed_by else "monitor_probe"
         existing_evidence.extend(
-            {"kind": "monitor_probe", "summary": truncate(item)} for item in evidence
+            {
+                "kind": evidence_kind,
+                "summary": truncate(item),
+                **({"suppressed_by": suppressed_by} if suppressed_by else {}),
+            }
+            for item in evidence
         )
         if len(existing_evidence) > MAX_INCIDENT_EVIDENCE:
             dropped = len(existing_evidence) - MAX_INCIDENT_EVIDENCE
             incident["evidence_dropped"] = int(incident.get("evidence_dropped", 0) or 0) + dropped
             del existing_evidence[:-MAX_INCIDENT_EVIDENCE]
+    if suppressed_by is not None:
+        incident["suppressed_count"] = int(incident.get("suppressed_count", 0) or 0) + 1
     incident["confirmation_count"] = max(
         int(incident.get("confirmation_count", 1) or 1), confirmation_count
     )
@@ -540,6 +555,55 @@ class Monitor:
                 return service
         return None
 
+    def _service_keys(self, service: Mapping[str, Any]) -> set[str]:
+        return {
+            str(value)
+            for value in (
+                service.get("service_id"),
+                service.get("container"),
+                service.get("recovery_group"),
+            )
+            if value
+        }
+
+    def _dependency_keys(self, service: Mapping[str, Any]) -> set[str]:
+        pending = [str(value) for value in service.get("depends_on", []) if value]
+        dependencies: set[str] = set()
+        while pending:
+            dependency = pending.pop()
+            if dependency in dependencies:
+                continue
+            dependencies.add(dependency)
+            target = next(
+                (
+                    candidate
+                    for candidate in self.services
+                    if dependency in self._service_keys(candidate)
+                ),
+                None,
+            )
+            if target is not None:
+                dependencies.update(self._service_keys(target))
+                pending.extend(str(value) for value in target.get("depends_on", []) if value)
+        return dependencies
+
+    def _processing_dependency_incident(
+        self,
+        service: Mapping[str, Any],
+    ) -> tuple[Path, str] | None:
+        dependencies = self._dependency_keys(service)
+        if not dependencies or not self.events_dir.exists():
+            return None
+        for path in self.events_dir.glob("incident-*.json"):
+            item = read_json(path, {})
+            if not isinstance(item, dict) or item.get("status") != "processing":
+                continue
+            group = str(item.get("recovery_group") or item.get("service") or "")
+            if group in dependencies:
+                incident_id = str(item.get("incident_id") or path.stem)
+                return path, incident_id
+        return None
+
     def confirm_signals(
         self,
         service: Mapping[str, Any],
@@ -577,6 +641,20 @@ class Monitor:
             return
         service_id = str(service.get("service_id") or service.get("container"))
         recovery_group = _recovery_group(service)
+        if set(signals).issubset(SOFT_SIGNALS):
+            dependency_incident = self._processing_dependency_incident(service)
+            if dependency_incident is not None:
+                append_incident_evidence(
+                    dependency_incident[0],
+                    service,
+                    observation,
+                    evidence,
+                    signals,
+                    confirmation_count,
+                    first_failed_at,
+                    suppressed_by=dependency_incident[1],
+                )
+                return
         existing = _find_open_incident(self.events_dir, recovery_group)
         if existing is not None:
             append_incident_evidence(

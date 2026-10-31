@@ -78,7 +78,7 @@
 - npu_command：NPU 健康检查命令；
 - log_check_command：可选的日志检查命令；命令退出码为 0 表示最近窗口没有匹配错误，非 0 表示发现日志错误或检查失败；不包含 KV connector 专用判断；
 - business_probe_command：可选的最小业务探针命令；命令退出码为 0 表示探针成功，非 0 表示业务探针失败；
-- depends_on：服务依赖；
+- depends_on：服务依赖，值可以是依赖服务的 service_id、container 或 recovery_group；上游事件处于 processing 时，下游软信号只记录、不重复通知 Agent；
 - recovery_scope：Agent 选择恢复范围时使用的部署事实。
 
 清单生成后，部署拓扑、容器、端口、设备或原始启动命令发生变化时必须重新生成清单并重启监控。监控进程只读清单，不在运行期间修改清单。
