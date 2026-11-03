@@ -170,7 +170,7 @@ function startServer(pi: ExtensionAPI): void {
 	if (server) return;
 	const host = process.env.VLLM_FAULT_NOTIFY_HOST ?? "127.0.0.1";
 	const port = Number(process.env.VLLM_FAULT_NOTIFY_PORT ?? "8765");
-	server = createServer((request, response) => {
+	const candidate = createServer((request, response) => {
 		if (request.method === "GET" && request.url === "/health") {
 			sendJson(response, 200, {
 				status: currentContext ? "ready" : "starting",
@@ -185,7 +185,22 @@ function startServer(pi: ExtensionAPI): void {
 		}
 		sendJson(response, 404, { accepted: false, status: "not_found" });
 	});
-	server.listen(port, host);
+	candidate.on("error", (error) => {
+		if (server === candidate) {
+			server = undefined;
+		}
+		console.error(
+			"[vllm-fault-events] 无法在本会话监听 " +
+				host +
+				":" +
+				port +
+				"：" +
+				error.message +
+				"。本会话将以非监听模式运行，不接收故障事件。",
+		);
+	});
+	server = candidate;
+	candidate.listen(port, host);
 }
 
 async function stopServer(): Promise<void> {

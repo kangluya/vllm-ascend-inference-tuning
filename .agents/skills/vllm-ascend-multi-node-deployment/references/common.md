@@ -171,12 +171,12 @@ multi-node PD-disaggregated deployment：Proxy → Decode/Prefill → Mooncake M
 └── deployment_report.json
 ```
 
-`commands.log` 记录脱敏命令和观察时间。`deployment_report.json` 是当前部署的派生 JSON artifact，至少记录：
+`commands.log` 逐条记录实际执行过的脱敏完整命令和观察时间，部署命令整条逐字记录、不拆段。`deployment_report.json` 是当前部署的派生 JSON artifact，至少记录：
 - `deployment_type`；
 - `execution.deployment_type` 和 `transport=ssh`；
 - 节点和服务映射；
 - 容器名；
-- 每个服务最终展开的命令、挂载、设备、端口；
+- 每个服务的完整部署命令：单条、逐字、可执行成功的完整命令（含容器名、网络、IPC、设备、挂载、环境变量、端口和容器内命令）；
 - 模型身份；
 - 最小业务请求结果；
 - 失败服务和清理动作；

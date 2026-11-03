@@ -47,17 +47,17 @@ class FaultMonitorTests(unittest.TestCase):
         self.assertIsNone(incident["recovery"])
         self.assertEqual(incident["recovery_group"], "decode-group")
 
-    def test_signals_include_configured_health_checks(self) -> None:
+    def test_signals_include_soft_observations(self) -> None:
         signals = _signals(
             {
-                "container_health": "unhealthy",
+                "readiness_ok": False,
                 "log_error": True,
                 "business_ok": False,
             }
         )
         self.assertEqual(
             signals,
-            ["container_unhealthy", "service_log_error", "business_failed"],
+            ["readiness_failed", "service_log_error", "business_failed"],
         )
 
     def test_process_check_command_must_target_container(self) -> None:

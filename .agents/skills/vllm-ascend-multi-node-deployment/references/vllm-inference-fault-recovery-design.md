@@ -47,14 +47,14 @@
 
 ### 2.1 常驻监控进程和异常退出保护
 
-故障检测由部署控制宿主机上的常驻监控进程持续执行。它在首次部署验收完成后启动，在服务运行期间保持运行。部署验收通过后，Agent 先登记 deployment_key 并确认 Pi Extension `/health` 已返回该 key，再按 SKILL.md 的执行流程注册并启动宿主机进程管理器单元；监控进程启动后自行将 monitor_pid、monitor_pgid、process_start_time、命令摘要、deployment_key 和清单路径写入 monitor-state.json，Agent 只读取和校验这些字段。
+故障检测由部署控制宿主机上的常驻监控进程持续执行。它在首次部署验收完成后启动，在服务运行期间保持运行。部署验收通过后，Agent 先登记 deployment_key 并确认 Pi Extension `/health` 已返回该 key，再按 SKILL.md 的执行流程注册并启动 systemd 监控单元；监控进程启动后自行将 monitor_pid、monitor_pgid、process_start_time、命令摘要、deployment_key 和清单路径写入 monitor-state.json，Agent 只读取和校验这些字段。
 
-监控进程由宿主机的 systemd 或等效进程管理器托管：
+监控进程由宿主机的 systemd 单元托管：
 
-- 监控进程异常退出、被 OOM 杀掉或宿主机重启后，进程管理器自动重新启动；
+- 监控进程异常退出、被 OOM 杀掉或宿主机重启后，systemd 自动重新启动；
 - 监控进程重新启动后读取部署清单，检查自身状态，并重新探测所有服务；
 - 仍处于 detected 或 processing 的事件继续保留并重新上报；
-- 进程管理器负责拉起监控进程，不负责故障分类和服务恢复。
+- systemd 只负责拉起监控进程，不负责故障分类和服务恢复。
 
 用户主动停止时，Agent 先停止对应的 systemd 单元，禁止监控进程被自动拉起；确认单元已停止后，再根据 monitor-state.json 中记录的 deployment_key、清单路径、PID/PGID、启动时间和命令身份校验当前进程。
 
@@ -82,11 +82,11 @@
 5. 仅将新生成的事件放入待上报队列；
 6. 继续检测其他服务。
 
-容器退出、Docker 运行时错误、进程消失、SSH 不可达和 NPU 异常等硬信号单次确认即可上报；readiness、日志、业务探针和容器健康状态等软信号需要连续三次探测失败后才上报，期间恢复则清零。单个事件只保留有限数量的最新证据，并记录被丢弃的旧证据数量。
+容器退出、Docker 运行时错误、进程消失、SSH 不可达和 NPU 异常等硬信号单次确认即可上报；readiness、日志和业务探针等软信号需要连续三次探测失败后才上报，期间恢复则清零。单个事件只保留有限数量的最新证据，并记录被丢弃的旧证据数量。
 
 监控进程不判断最终故障类型，也不执行恢复动作。事件必须先写入临时文件，再通过原子改名发布；检测进程重启后继续处理仍处于待处理状态的事件。
 
-Agent 开始恢复前必须先将主故障事件置为 `processing`。恢复期间，依赖该服务或恢复组的服务如果只有 readiness、日志、业务探针或容器健康等软信号，监控只记录证据，不新建事件或重复通知 Agent；主事件恢复后再重新检查依赖服务。依赖服务出现容器退出、SSH 不可达或 NPU 异常等硬信号时，仍可单独生成事件。
+Agent 开始恢复前必须先将主故障事件置为 `processing`。恢复期间，依赖该服务或恢复组的服务如果只有 readiness、日志或业务探针等软信号，监控只记录证据，不新建事件或重复通知 Agent；主事件恢复后再重新检查依赖服务。依赖服务出现容器退出、SSH 不可达或 NPU 异常等硬信号时，仍可单独生成事件。
 
 ## 3. 故障事件传递给当前 Pi Agent
 
@@ -202,7 +202,7 @@ Agent 可以根据实际日志和镜像行为调整恢复顺序，不受固定�
 - 只操作本次部署清单中的节点、容器和服务；
 - 验证镜像、设备、容器身份和原始启动参数；
 - 不使用宽范围 pkill、kill -9 或无归属校验的 docker rm；
-- 不通过缩卡、改单机或删除角色来伪造恢复成功；
+- 不通过缩卡、改单机或删除角色来伪造恢复成功；满足降级恢复前置判定和执行约束时允许降级，终态必须为 recovered_degraded；
 - 恢复完成后通过真实验收确认服务可用。
 
 故障分类表是 Agent 的决策参考，不是检测部分中的自动匹配代码。证据不足时，Agent 先请求补充探测或报告无法确认。
@@ -221,7 +221,7 @@ Agent 可以根据实际日志和镜像行为调整恢复顺序，不受固定�
 | KV connector 或 Mooncake 异常 | connector 初始化、注册、KV 获取/发送或远端 engine 查询失败 | 角色组或单服务：按受影响的 P/D 角色组重建；Mooncake 服务单独故障时先重建该服务 | 2–15 分钟，另加实际模型加载时间 | P/D 重新注册失败，迁移受影响角色组 |
 | Proxy 异常 | Proxy 进程退出、入口端口不可用或后端列表丢失 | 单服务：只重建 Proxy，保留健康的 P/D 和 KV 服务 | 10 秒–2 分钟 | Proxy 恢复后真实请求仍失败，重新检查后端角色组 |
 | 网络或 SSH 不可达 | SSH、数据面 IP、通信端口或网卡连续不可达 | 节点或整体部署：等待短暂抖动，同时隔离故障端点 | 不固定；短暂抖动通常 1–5 分钟，迁移通常 10–30 分钟 | 节点或链路持续不可用，迁移到通过预检的备用节点 |
-| NPU 不健康 | npu-smi 健康异常、设备丢失、驱动或 HCCL 报错 | 节点或整体部署：隔离使用故障设备的服务，不执行自动芯片 reset | 有备用节点时通常 10–30 分钟；无备用节点时无法自动恢复 | 有等价备用节点则迁移；没有则报告降级或失败 |
+| NPU 不健康 | npu-smi 健康异常、设备丢失、驱动或 HCCL 报错 | 节点或整体部署：隔离使用故障设备的服务，不执行自动芯片 reset | 有备用节点时通常 10–30 分钟；无备用节点时无法自动恢复 | 有等价备用节点则迁移；没有则按降级恢复约束执行降级或报告失败 |
 | 宿主机不健康 | SSH 失败、Docker/Ascend 运行时不可用或关键目录不可读 | 节点或整体部署：不在故障宿主机上无限重试 | 有备用节点时通常 10–30 分钟；无备用节点时无法自动恢复 | 迁移该节点上的服务或报告失败 |
 | 配置、镜像或模型错误 | 参数互斥、挂载缺失、镜像 digest 不一致、模型加载失败、端口冲突 | 不恢复：停止自动重试并保留完整证据 | 不自动恢复 | 由用户修正部署计划后重新部署 |
 | 资源耗尽 | 显存、KV Cache、磁盘、端口或设备资源不足 | 单服务或容器：不自动缩小 TP/DP/PP/EP；可清理本次残留后重试一次 | 清理重试通常 1–10 分钟；迁移通常 10–30 分钟 | 仍不足则使用已声明的等价备用节点或报告失败 |
@@ -246,7 +246,7 @@ Agent 只有在确认以下条件后才选择原地恢复：
 4. 故障不属于持续的宿主机、网络或 NPU 故障；
 5. 恢复不改变 TP、DP、PP、EP、rank 和服务拓扑。
 
-原地恢复必须使用部署记录中的原镜像、原挂载、原设备、原环境变量和原始启动参数。Agent 不能因为恢复失败而自行缩小并行规模或改单机部署。
+原地恢复必须使用部署记录中的原镜像、原挂载、原设备、原环境变量和原始启动参数。Agent 不能因为恢复失败而自行缩小并行规模或改单机部署；降级恢复只能按 fault-monitoring-and-recovery.md 第 5.3 节的前置判定和执行约束执行。
 
 ### 5.3 备用节点迁移
 
@@ -299,8 +299,7 @@ SKILL.md 是多机部署与故障检测恢复的统一入口，负责模式选�
 │   ├── common.md
 │   ├── multi-node-deployment.md
 │   ├── multi-node-PD-disaggregated-deployment.md
-│   ├── monitor-manifest.md
-│   └── fault-recovery.md
+│   └── fault-monitoring-and-recovery.md
 └── scripts/
     └── vllm_fault_monitor.py
 
@@ -310,12 +309,10 @@ SKILL.md 是多机部署与故障检测恢复的统一入口，负责模式选�
 
 其中：
 
-- SKILL.md：统一描述多机部署和故障检测恢复，并引用两个故障恢复参考文件；
-- monitor-manifest.md：定义监控清单、检查命令、control_host 和 HTTP 通知配置；
-- fault-recovery.md：定义故障检测、事件传递、Agent 分析、恢复策略和验收流程。
+- fault-monitoring-and-recovery.md：定义部署后监控初始化、监控清单契约、systemd 监控单元、故障检测、事件传递、Agent 分析、恢复策略和验收流程；
 - vllm_fault_monitor.py：负责检测故障、保存事件和通过 HTTP 通知 Pi Extension；
 - vllm-fault-events.ts：负责 HTTP 接收和 pi.sendMessage，不执行恢复；
-- common.md、multi-node-deployment.md 和 multi-node-PD-disaggregated-deployment.md：保留多机部署公共规则和部署模式说明。
+- SKILL.md、common.md、multi-node-deployment.md 和 multi-node-PD-disaggregated-deployment.md：保留多机部署公共规则和部署模式说明。
 
 部署完成后，Agent 通过 SSH 将 `scripts/vllm_fault_monitor.py` 复制到控制宿主机的
 `/data/boom/deployment/scripts/vllm_fault_monitor.py`，systemd 使用这个运行时副本启动监控。

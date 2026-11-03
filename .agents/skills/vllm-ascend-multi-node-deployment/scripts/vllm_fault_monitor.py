@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 LOGGER = logging.getLogger("vllm_fault_monitor")
-TERMINAL_STATES = {"recovered", "failed", "waiting_for_user"}
+TERMINAL_STATES = {"recovered", "recovered_degraded", "failed", "waiting_for_user"}
 MAX_EVIDENCE = 2000
 MAX_INCIDENT_EVIDENCE = 100
 SOFT_SIGNAL_CONFIRMATIONS = 3
@@ -37,7 +37,6 @@ HARD_SIGNALS = {
     "npu_unhealthy",
 }
 SOFT_SIGNALS = {
-    "container_unhealthy",
     "readiness_failed",
     "service_log_error",
     "business_failed",
@@ -191,7 +190,6 @@ def _service_probe(
         "container": container,
         "ssh_reachable": True,
         "container_status": "unknown",
-        "container_health": None,
         "process_present": None,
         "readiness_ok": None,
         "npu_healthy": None,
@@ -229,7 +227,6 @@ def _service_probe(
         observation["container_status"] = parts[0] if parts else "unknown"
         observation["oom_killed"] = len(parts) > 1 and parts[1].lower() == "true"
         observation["exit_code"] = parts[2] if len(parts) > 2 else ""
-        observation["container_health"] = parts[3] if len(parts) > 3 and parts[3] else None
         evidence.append("docker_inspect: " + truncate(inspect.stdout))
 
     process_command = _command(service.get("process_check_command"))
@@ -275,8 +272,6 @@ def _signals(observation: Mapping[str, Any]) -> list[str]:
         signals.append("container_exited")
     if observation.get("container_status") == "docker_runtime_error":
         signals.append("docker_runtime_error")
-    if observation.get("container_health") == "unhealthy":
-        signals.append("container_unhealthy")
     if observation.get("process_present") is False:
         signals.append("process_missing")
     if observation.get("readiness_ok") is False:

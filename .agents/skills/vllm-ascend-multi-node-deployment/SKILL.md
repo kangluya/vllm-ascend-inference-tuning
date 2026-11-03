@@ -53,6 +53,13 @@ Skill 按多机公共规则和对应部署说明生成，不由 Provider 提供�
 - 多机容器清理只处理与本次部署容器名精确匹配的对象，禁止使用 `pkill`、宽范围
   `docker rm` 或通过端口占用者推断所有权。
 
+## 故障检测和恢复
+
+- 部署首次验收通过或接收到故障事件后，读取并遵守 [故障监控与恢复](references/fault-monitoring-and-recovery.md)；
+- 部署首次验收通过后，按其"部署后监控初始化"章节生成 monitor-manifest.json（字段契约见同文件第 3 章）、调用 Pi Extension 登记路由并确认生效、复制监控脚本、注册并启动 systemd 监控单元；
+- 故障事件到达当前 Pi 会话后，按"故障事件处理"及后续章节复核证据、判断故障类型、选择恢复范围、执行 SSH/Docker 恢复并完成真实验收；监控进程只探测和上报，不执行恢复动作；
+- 用户要求停止服务时，按"用户主动停止"章节先停止 systemd 监控单元，再按逆依赖顺序通过 SSH 停止服务。
+
 ## 参考资料
 
 - [多机公共规则](references/common.md)：SSH、Docker、挂载、部署、验收和清理。
@@ -60,25 +67,5 @@ Skill 按多机公共规则和对应部署说明生成，不由 Provider 提供�
   启动与验证。
 - [multi-node PD-disaggregated deployment](references/multi-node-PD-disaggregated-deployment.md)：
   Prefill/Decode、KV Transfer 和 Proxy。
-
-## 故障检测和恢复
-
-部署首次验收通过后，继续执行以下初始化：
-
-1. 生成或更新 monitor-manifest.json，包含 deployment_key、control_host、本机 agent_notify endpoint、探测周期，以及每个服务的节点、容器、recovery_group、基于实机进程身份生成的必填容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；端口、设备、挂载、环境变量和完整启动命令继续记录在 deployment_report.json 与 commands.log；
-2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；
-3. 调用Pi Extension的健康检查接口确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功；确认失败时停止流程，不得启动监控单元；
-4. 将 `scripts/vllm_fault_monitor.py` 复制到控制宿主机的 `/data/boom/deployment/vllm_fault_monitor.py`，并设置为可执行；
-5. 只有路由确认成功且脚本复制完成后，才能注册并启动本次部署的 systemd 监控单元；
-6. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
-7. 监控进程通过 HTTP 向 Pi Extension 的 /v1/fault-events 上报事件。
-
-故障事件到达当前 Pi 后，读取并遵守：
-
-- references/monitor-manifest.md：监控清单契约；
-- references/fault-recovery.md：故障检测与恢复流程。
-
-Agent 负责重新检查证据、判断故障类型、选择恢复范围、执行 SSH/Docker 恢复并完成真实验收。监控进程不执行恢复动作。
-
-用户要求停止服务时，先停止对应的 systemd 监控单元并验证当前 PID/PGID、启动时间和命令身份，再按逆依赖顺序通过 SSH 停止服务。
+- [故障监控与恢复](references/fault-monitoring-and-recovery.md)：部署后监控初始化、监控清单契约、进程管理要求、故障事件处理、恢复策略和用户主动停止。
 
