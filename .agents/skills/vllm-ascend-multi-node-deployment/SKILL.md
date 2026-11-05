@@ -55,8 +55,8 @@ Skill 按多机公共规则和对应部署说明生成，不由 Provider 提供�
 
 ## 故障检测和恢复
 
-- 部署首次验收通过或接收到故障事件后，读取并遵守 [故障监控与恢复](references/fault-monitoring-and-recovery.md)；
-- 部署首次验收通过后，按其"部署后监控初始化"章节生成 monitor-manifest.json（字段契约见同文件第 3 章）、调用 Pi Extension 登记路由并确认生效、复制监控脚本、注册并启动 systemd 监控单元；
+- 部署首次验收通过、用户要求为已有部署接入故障监控，或接收到故障事件后，读取并遵守 [故障监控与恢复](references/fault-monitoring-and-recovery.md)；
+- 部署首次验收通过后，按其"监控初始化"章节生成 monitor-manifest.json（字段契约见同文件第 3 章）、调用 Pi Extension 登记路由并确认生效、复制监控脚本、注册并启动 systemd 监控单元；用户要求为已有部署接入故障监控时，先按该章节的接入前置步骤实机核对用户提供的逐字部署命令、转写落盘并完成接入验收，再执行同样的初始化；
 - 故障事件到达当前 Pi 会话后，按"故障事件处理"及后续章节复核证据、判断故障类型、选择恢复范围、执行 SSH/Docker 恢复并完成真实验收；监控进程只探测和上报，不执行恢复动作；
 - 用户要求停止服务时，按"用户主动停止"章节先停止 systemd 监控单元，再按逆依赖顺序通过 SSH 停止服务。
 
@@ -67,5 +67,5 @@ Skill 按多机公共规则和对应部署说明生成，不由 Provider 提供�
   启动与验证。
 - [multi-node PD-disaggregated deployment](references/multi-node-PD-disaggregated-deployment.md)：
   Prefill/Decode、KV Transfer 和 Proxy。
-- [故障监控与恢复](references/fault-monitoring-and-recovery.md)：部署后监控初始化、监控清单契约、进程管理要求、故障事件处理、恢复策略和用户主动停止。
+- [故障监控与恢复](references/fault-monitoring-and-recovery.md)：监控初始化、systemd 监控单元、监控清单契约、故障事件处理、恢复策略和用户主动停止。
 

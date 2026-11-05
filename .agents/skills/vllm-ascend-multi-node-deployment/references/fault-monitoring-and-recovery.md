@@ -1,13 +1,23 @@
 # 故障监控与恢复
 
-本文件供 vLLM 多机部署 Skill 使用：部署验收通过后按本文件初始化故障监控（第 1-3 章），故障事件到达当前 Pi 后按本文件执行复核、恢复和验收（第 4-5 章），用户要求停止服务时按第 6 章执行。监控进程只负责探测和 HTTP 上报，不执行恢复动作；Agent 负责监控初始化、复核、判断、恢复、验收和停止。
+本文件供 vLLM 多机部署服务使用：部署验收通过后或直接接入已有部署时，按本文件初始化故障监控（第 1-3 章），故障事件到达当前 Pi 后按本文件执行复核、恢复和验收（第 4-5 章），用户要求停止服务时按第 6 章执行，Pi 会话结束或崩溃后按第 7 章恢复监控接管。监控进程只负责探测和 HTTP 上报，不执行恢复动作；Agent 负责监控初始化、复核、判断、恢复、验收和停止。
 
-## 1. 部署后监控初始化
+## 1. 监控初始化
 
-部署首次验收通过后，继续执行以下初始化：
+监控初始化有两种入口，在部署首次验收通过后直接进入初始化；要监控已经部署成功的模型，先完成第 1.1 节的接入前置步骤，再进入同样的初始化。
 
-1. 生成 monitor-manifest.json，包含 deployment_key、control_host、本机 agent_notify endpoint、探测周期，以及每个服务的节点、容器、recovery_group、基于实机进程身份生成的必填容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；端口、设备、挂载、环境变量和完整部署命令继续记录在 deployment_report.json 与 commands.log；monitor-manifest.json 的字段契约见本文件第 3 章；
-2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；调用 Pi Extension 的健康检查接口确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功；确认失败时停止流程，不得启动监控单元；
+### 1.1 接入已有部署的前置步骤
+
+用户要求为已有部署接入故障监控时，需要用户提供逐字部署命令清单（每条命令及其所在节点）、各节点 SSH 访问方式和服务形态说明（普通多机或 PD 分离、各节点角色）。
+
+1. 实机核对：逐节点通过 SSH 检查容器、进程、端口和 NPU 状态，把用户提供的命令清单与实机状态互证；不一致时以实机为准，并向用户澄清是清单过时还是实机存在异常；
+2. 命令落盘：核对过的命令逐字写入部署目录的 deployment_report.json与commands.log；部署报告标注"接入已有部署"，记录命令来源和核对结果，后续恢复以此记录为准；
+3. 接入验收：逐节点完成 NPU 健康检查，逐服务完成进程身份、readiness、通信和业务验收；接入时发现既有异常，默认先按第 5 章处理并通过验收后再监控。
+
+部署首次验收通过或接入前置步骤完成后，继续执行以下初始化：
+
+1. 生成 monitor-manifest.json，包含 deployment_key、control_host、监控进程可送达的 agent_notify endpoint（字段规则见第 3.2 节）、探测周期，以及每个服务的节点、容器、recovery_group、基于实机进程身份生成的必填容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；端口、设备、挂载、环境变量和完整部署命令继续记录在 deployment_report.json 与 commands.log；monitor-manifest.json 的字段契约见本文件第 3 章；
+2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；从控制宿主机侧请求 agent_notify 端点的健康检查接口（同机时即本地请求；不同机时通过 SSH 在控制宿主机上请求）确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功；确认失败时停止流程，不得启动监控单元；
 3. 将 Skill 中的 `scripts/vllm_fault_monitor.py` 通过 SSH 复制到控制宿主机的 `/data/boom/deployment/vllm_fault_monitor.py`，并设置为可执行；只有路由确认成功且脚本复制完成后，才能注册并启动本次部署的 systemd 监控单元；
 4. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
 5. 监控进程通过 HTTP 向 Pi Extension 的 /v1/fault-events 上报事件。
@@ -92,7 +102,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 - deployment_key：本次部署的稳定标识，用于把事件路由到当前 Pi 会话；
 - deployment_dir：控制宿主机上的部署目录；
 - control_host.ssh_target：Agent 从 Pi 容器通过 SSH 读取事件和部署资料时使用的目标；
-- agent_notify.endpoint：监控进程向 Pi Extension 上报事件的 HTTP 地址；
+- agent_notify.endpoint：监控进程向 Pi Extension 上报事件的 HTTP 地址，必须是监控进程可送达的地址：监控与 Pi 同机时为本机回环；不同机时，由 Pi 所在机器通过 SSH 反向隧道把 Extension 的监听端口落到控制宿主机回环（endpoint 仍为回环形态），或在防火墙白名单限制下直连 Pi 所在机器。Extension 的监听地址和端口由环境变量 VLLM_FAULT_NOTIFY_HOST（默认 127.0.0.1）和 VLLM_FAULT_NOTIFY_PORT（默认 8765）控制；通知接口无认证，除上述形态外不得暴露到网络；
 - probe_timeout_seconds：单次 SSH 或检查命令的最长等待时间；
 - probe_interval_seconds：没有事件推送时的兜底探测周期；
 - services：本次部署中需要持续观察的服务；
@@ -113,7 +123,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 
 清单生成后，部署拓扑、容器、端口、设备或原始启动命令发生变化时必须重新生成清单并重启监控。监控进程只读清单，不在运行期间修改清单。
 
-命令字段只保存经过部署阶段确认的检查命令。命令结果、凭据和完整日志写入部署运行目录或脱敏日志，不写入清单。
+命令字段只保存经过部署验收或已部署完成的服务提供的确认的检查命令。命令结果、凭据和完整日志写入部署运行目录或脱敏日志，不写入清单。
 
 Pi Extension 只在本机回环端口接收事件，并继续校验已登记的 deployment_key、incident_id 和事件路径；不得把该端口发布到外部网络。
 
@@ -195,7 +205,7 @@ Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原�
 - 同一恢复范围多次失败；
 - 原节点无法提供原拓扑所需设备。
 
-备用节点必须在部署前通过 SSH、Docker、镜像 digest、Ascend 挂载、NPU 型号和数量、网络、模型路径、端口、日志目录和设备占用检查。
+备用节点必须在部署前或接入已有部署时通过 SSH、Docker、镜像 digest、Ascend 挂载、NPU 型号和数量、网络、模型路径、端口、日志目录和设备占用检查。
 
 迁移后重新确认通信 IP、网卡、设备列表、rank 地址、Proxy 后端、KV 端口和 Mooncake 地址。模型、镜像、并行规模和服务角色保持不变。
 
@@ -241,3 +251,16 @@ Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原�
 6. 验证所有服务和容器已停止。
 
 不使用宽范围 pkill、kill -9 或端口占用者推断进程归属。
+
+## 7. 会话恢复
+
+Pi 会话结束或崩溃后，deployment_key 与会话的路由随 Pi 进程内存一起消失；新会话的扩展会自动监听通知端口，但不认识任何 deployment_key。通知链路本身不受影响：agent_notify 端点的地址不随 Pi 重启变化，新会话的扩展在同一地址重新监听（反向隧道形态下隧道独立于 Pi 进程，端点原样成立），监控的投递队列对未送达事件无限重试。已送达旧会话但未处理完的事件不在投递队列里，只能通过对账发现。
+
+新会话中用户要求恢复某部署的故障监控（或用户告知存在历史部署）时：
+
+1. 从用户处确认控制宿主机 SSH 目标和部署目录；
+2. 通过 SSH 读取 monitor-state.json 和 monitor-manifest.json，确认 deployment_key 与清单路径；确认 systemd 监控单元仍在运行，已停止时按第 2 章重新启动；
+3. 调用 Pi Extension 的 vllm_fault_register_deployment 将 deployment_key 重新登记到当前会话，并从控制宿主机侧请求 agent_notify 端点的 /health 确认 deployment_keys 已包含该 key；
+4. 登记后监控会在下一个重试周期内（半分钟级）把投递队列中未送达的事件推送进当前会话；
+5. 同时通过 SSH 对账 events/ 目录中全部非终态事件（status 为 detected 或 processing），已送达旧会话但未处理完的事件只能由此发现；对账与推送按 incident_id 去重后，逐个按第 4 章流程处理；
+6. 对账无待办时向用户报告当前监控状态干净。
