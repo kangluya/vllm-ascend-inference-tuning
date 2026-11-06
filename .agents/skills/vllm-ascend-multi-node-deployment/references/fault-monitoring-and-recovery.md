@@ -155,11 +155,11 @@ recovered / recovered_degraded / failed / waiting_for_user
 事件文件由监控进程和 Agent 共同维护，但写入范围不同：
 
 - 监控进程首次发布事件时写入 `schema_version`、`incident_id`、`deployment_key`、`detected_at`、`service`、`node`、`recovery_group`、`affected_services`、`signals`、`evidence`、`evidence_dropped`、`confirmation_count`、`first_failed_at`、`observation`、`trigger`、`status` 和 `updated_at`，初始状态为 `detected`；同一 recovery_group 的后续探测只追加证据，不新建事件；
-- Agent 开始处理时将 `status` 改为 `processing`，并补充 `diagnosis`、`recovery` 和 `validation`；
-- Agent 完成验收后将状态改为 `recovered`、`recovered_degraded`、`failed` 或 `waiting_for_user`；
+- Agent 开始处理时将 `status` 改为 `processing`，并补充三个字段：`diagnosis`（故障判断及依据：结论、指向本事件 `evidence` 条目的证据引用、排除的假设）、`recovery`（恢复执行记录：选择的恢复策略与范围、实际执行的动作、SSH/Docker 操作及结果、是否使用备用节点）和 `validation`（验收记录：readiness、通信、模型身份和真实 completion 的逐项验收结果）；
+- Agent 完成验收后将 `status` 改为 `recovered`、`recovered_degraded`、`failed` 或 `waiting_for_user`，仍需用户处理的事项写入 `diagnosis`；`failed` 和 `waiting_for_user` 表示故障尚未解决：同组后续监控探测继续向该事件追加证据，不新建事件、不再次通知 Agent；仅当故障已解决，事件状态为 `recovered` 或 `recovered_degraded`后，同组再次出现故障才新建事件；
 - 监控进程不覆盖 Agent 已写入的处理和验收字段。
 
-容器退出、Docker 运行时错误、进程消失、SSH 不可达和 NPU 异常等硬信号单次确认即可上报；readiness、日志和业务探针等软信号需要连续三次探测失败后才上报，期间恢复则清零。单个事件最多保留 100 条最新证据，超出部分通过 `evidence_dropped` 记录数量。
+容器退出、Docker 运行时错误、进程消失、SSH 不可达和 NPU 异常等硬信号单次确认即可上报；readiness、日志和业务探针等软信号需要连续三次探测失败后才上报，期间恢复则清零。
 
 Agent 开始恢复前必须先将主故障事件状态更新为 `processing`。在该状态期间，依赖该服务或恢复组的其他服务如果只出现 readiness、日志或业务探针等软信号，监控进程只将证据追加到主事件，不新建事件或再次通知 Agent。主事件恢复完成后，监控重新探测依赖服务；依赖服务仍异常时，再生成新的故障事件。依赖服务自身出现容器退出、SSH 不可达或 NPU 异常等硬信号时，仍可以单独上报。
 
@@ -254,13 +254,12 @@ Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原�
 
 ## 7. 会话恢复
 
-Pi 会话结束或崩溃后，deployment_key 与会话的路由随 Pi 进程内存一起消失；新会话的扩展会自动监听通知端口，但不认识任何 deployment_key。通知链路本身不受影响：agent_notify 端点的地址不随 Pi 重启变化，新会话的扩展在同一地址重新监听（反向隧道形态下隧道独立于 Pi 进程，端点原样成立），监控的投递队列对未送达事件无限重试。已送达旧会话但未处理完的事件不在投递队列里，只能通过对账发现。
-
-新会话中用户要求恢复某部署的故障监控（或用户告知存在历史部署）时：
+Pi会话崩溃或异常退出后，新开启的会话中用户要求恢复某部署的故障监控时：
 
 1. 从用户处确认控制宿主机 SSH 目标和部署目录；
 2. 通过 SSH 读取 monitor-state.json 和 monitor-manifest.json，确认 deployment_key 与清单路径；确认 systemd 监控单元仍在运行，已停止时按第 2 章重新启动；
 3. 调用 Pi Extension 的 vllm_fault_register_deployment 将 deployment_key 重新登记到当前会话，并从控制宿主机侧请求 agent_notify 端点的 /health 确认 deployment_keys 已包含该 key；
-4. 登记后监控会在下一个重试周期内（半分钟级）把投递队列中未送达的事件推送进当前会话；
-5. 同时通过 SSH 对账 events/ 目录中全部非终态事件（status 为 detected 或 processing），已送达旧会话但未处理完的事件只能由此发现；对账与推送按 incident_id 去重后，逐个按第 4 章流程处理；
-6. 对账无待办时向用户报告当前监控状态干净。
+4. 等待监控在下一个重试周期内把未送达的事件推送进当前会话；
+5. 通过 SSH 对账 events/ 目录中全部未解决事件（status 为 detected、processing、waiting_for_user 或 failed），与已推送事件按 incident_id 去重：detected/processing 逐个按第 4 章流程处理；waiting_for_user/failed 只向用户提示存在待裁决或已放弃的事件，不重复进入恢复流程；
+6. 无未解决事件时向用户报告当前监控状态干净。
+   
