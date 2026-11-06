@@ -25,7 +25,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 LOGGER = logging.getLogger("vllm_fault_monitor")
-TERMINAL_STATES = {"recovered", "recovered_degraded", "failed", "waiting_for_user"}
+# Resolved states release the recovery group for a new incident; failed and
+# waiting_for_user incidents keep an unresolved fault and stay append targets.
+RESOLVED_STATES = {"recovered", "recovered_degraded"}
 MAX_EVIDENCE = 2000
 MAX_INCIDENT_EVIDENCE = 100
 SOFT_SIGNAL_CONFIRMATIONS = 3
@@ -293,19 +295,27 @@ def _find_open_incident(
     events_dir: Path,
     recovery_group: str,
 ) -> Path | None:
+    # Unresolved incidents (anything but resolved states) are append targets:
+    # the monitor never opens a duplicate incident or re-notifies the Agent
+    # while a failed/waiting_for_user incident still represents the fault.
     if not events_dir.exists():
         return None
+    newest: Path | None = None
+    newest_updated = ""
     for path in events_dir.glob("incident-*.json"):
         item = read_json(path, {})
         if not isinstance(item, dict):
             continue
-        if item.get("status") in TERMINAL_STATES:
+        if item.get("status") in RESOLVED_STATES:
             continue
         item_group = item.get("recovery_group") or item.get("service")
         if item_group != recovery_group:
             continue
-        return path
-    return None
+        updated = str(item.get("updated_at") or "")
+        if updated >= newest_updated:
+            newest = path
+            newest_updated = updated
+    return newest
 
 
 def append_incident_evidence(
@@ -337,14 +347,39 @@ def append_incident_evidence(
     existing_evidence = incident.setdefault("evidence", [])
     if isinstance(existing_evidence, list):
         evidence_kind = "suppressed_dependency" if suppressed_by else "monitor_probe"
-        existing_evidence.extend(
-            {
-                "kind": evidence_kind,
-                "summary": truncate(item),
-                **({"suppressed_by": suppressed_by} if suppressed_by else {}),
-            }
-            for item in evidence
-        )
+        now = utc_now()
+        items = [truncate(item) for item in evidence]
+        target = None
+        for entry in reversed(existing_evidence):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("kind") != evidence_kind or entry.get("service") != service_id:
+                continue
+            previous = entry.get("items")
+            same_items = (
+                isinstance(previous, list)
+                and previous
+                and {str(value) for value in previous} == set(items)
+            )
+            if not same_items:
+                break
+            target = entry
+            break
+        if target is not None:
+            target["repeat_count"] = int(target.get("repeat_count", 1) or 1) + 1
+            target["last_seen_at"] = now
+        else:
+            existing_evidence.append(
+                {
+                    "kind": evidence_kind,
+                    "service": service_id,
+                    "items": items,
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "repeat_count": 1,
+                    **({"suppressed_by": suppressed_by} if suppressed_by else {}),
+                }
+            )
         if len(existing_evidence) > MAX_INCIDENT_EVIDENCE:
             dropped = len(existing_evidence) - MAX_INCIDENT_EVIDENCE
             incident["evidence_dropped"] = int(incident.get("evidence_dropped", 0) or 0) + dropped
@@ -384,10 +419,18 @@ def build_incident(
         "affected_services": [service.get("service_id") or service.get("container")],
         "signals": signals,
         "evidence": [
-            {"kind": "monitor_probe", "summary": truncate(item)}
-            for item in evidence[-MAX_INCIDENT_EVIDENCE:]
-        ],
-        "evidence_dropped": max(0, len(evidence) - MAX_INCIDENT_EVIDENCE),
+            {
+                "kind": "monitor_probe",
+                "service": service.get("service_id") or service.get("container"),
+                "items": [truncate(item) for item in evidence],
+                "first_seen_at": detected_at,
+                "last_seen_at": detected_at,
+                "repeat_count": 1,
+            }
+        ]
+        if evidence
+        else [],
+        "evidence_dropped": 0,
         "observation": dict(observation),
         "trigger": dict(event or {}),
         "status": "detected",
