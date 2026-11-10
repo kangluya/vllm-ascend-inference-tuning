@@ -147,7 +147,9 @@ async function handleFaultEvent(
 			},
 			{
 				triggerTurn: true,
-				deliverAs: "followUp",
+				// steer：会话进行中到达的事件注入当前轮（下一条助手消息边界进入，逐条注入），
+				// 避免逐事件各开一轮对话；会话空闲时 triggerTurn 直接开新轮。
+				deliverAs: "steer",
 			},
 		);
 		delivered.add(deliveryKey);
