@@ -4,9 +4,14 @@
 
 ## 1. 监控初始化
 
-监控初始化有两种入口，在部署首次验收通过后直接进入初始化；要监控已经部署成功的模型，先完成第 1.1 节的接入前置步骤，再进入同样的初始化。
+### 1.1 选择初始化入口
 
-### 1.1 接入已有部署的前置步骤
+根据部署所处阶段选择入口，两种入口最终都执行第 1.3 节的通用初始化步骤。
+
+- **新部署完成后接入监控**：本次部署已经按部署流程完成验收，直接执行第 1.3 节。
+- **为已有部署接入监控**：先执行第 1.2 节，核对并补齐恢复所需的部署事实；前置步骤完成后，再执行第 1.3 节。
+
+### 1.2 为已有部署补齐前置条件
 
 用户要求为已有部署接入故障监控时，需要用户提供逐字部署命令清单（每条命令及其所在节点）、各节点 SSH 访问方式和服务形态说明（普通多机或 PD 分离、各节点角色）。
 
@@ -14,7 +19,9 @@
 2. 命令落盘：核对过的命令逐字写入部署目录的 deployment_report.json与commands.log；部署报告标注"接入已有部署"，记录命令来源和核对结果，后续恢复以此记录为准；
 3. 接入验收：逐节点完成 NPU 健康检查，逐服务完成进程身份、readiness、通信和业务验收；接入时发现既有异常，默认先按第 5 章处理并通过验收后再监控。
 
-部署首次验收通过或接入前置步骤完成后，继续执行以下初始化：
+### 1.3 两种入口共用的初始化步骤
+
+执行本节前必须满足以下任一条件：本次新部署已经通过部署验收，或者已有部署已经完成第 1.2 节的核对、记录和接入验收。满足条件后按以下顺序初始化监控：
 
 1. 生成 monitor-manifest.json，包含 deployment_key、control_host、监控进程可送达的 agent_notify endpoint（字段规则见第 3.2 节）、探测周期，以及每个服务的节点、容器、recovery_group、基于实机进程身份生成的必填容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；端口、设备、挂载、环境变量和完整部署命令继续记录在 deployment_report.json 与 commands.log；monitor-manifest.json 的字段契约见本文件第 3 章；
 2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；从控制宿主机侧请求 agent_notify 端点的健康检查接口（同机时即本地请求；不同机时通过 SSH 在控制宿主机上请求）确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功；确认失败时停止流程，不得启动监控单元；
@@ -77,6 +84,13 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
         "curl",
         "--fail",
         "--silent",
+        "--show-error",
+        "--max-time",
+        "5",
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "\\nhttp=%{http_code}\\n",
         "http://127.0.0.1:8000/health"
       ],
       "npu_command": [
@@ -104,28 +118,25 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 - control_host.ssh_target：Agent 从 Pi 容器通过 SSH 读取事件和部署资料时使用的目标；
 - agent_notify.endpoint：监控进程向 Pi Extension 上报事件的 HTTP 地址，必须是监控进程可送达的地址：监控与 Pi 同机时为本机回环；不同机时，由 Pi 所在机器通过 SSH 反向隧道把 Extension 的监听端口落到控制宿主机回环（endpoint 仍为回环形态），或在防火墙白名单限制下直连 Pi 所在机器。Extension 的监听地址和端口由环境变量 VLLM_FAULT_NOTIFY_HOST（默认 127.0.0.1）和 VLLM_FAULT_NOTIFY_PORT（默认 8765）控制；通知接口无认证，除上述形态外不得暴露到网络；
 - probe_timeout_seconds：单次 SSH 或检查命令的最长等待时间；
-- probe_interval_seconds：没有事件推送时的兜底探测周期；
+- `probe_interval_seconds` 控制全量巡检周期。Docker 事件触发对应服务的额外检查；
 - services：本次部署中需要持续观察的服务；
 - service_id：服务稳定标识；
 - role：服务角色，例如 master、worker、prefill、decode、proxy 或 mooncake；
 - host：服务所在目标宿主机的 SSH 目标；
 - container：精确容器名；
 - recovery_group：最小恢复单元的稳定标识；同一 rank 组或角色组应使用相同值；单服务使用自身 service_id；
-- process_check_command：必填的容器内进程检查命令数组，必须以 `docker exec <container>` 或 `docker top <container>` 开头，由监控进程通过 SSH 执行；命令必须根据部署完成后实际观察到的进程命令生成。<verified-process-pattern>替换为本次部署真实的模型路径和参数；
-- readiness_command：服务 readiness 检查命令；只对自身监听 API 端口的服务配置，命令在部署验收时实际执行通过后才写入清单；
+- `process_check_command` 是必填的容器内进程检查命令数组，以 `docker exec <container>` 或 `docker top <container>` 开头。监控进程通过 SSH 在目标宿主机执行该命令。将 `<verified-process-pattern>` 替换为本次部署实机核实的模型路径和参数。使用 `docker exec` 检查时，未找到匹配进程应返回 `1`，且 stderr 为空；
+- `readiness_command` 只对自身监听 API 端口的服务配置，使用部署验收通过的命令；
 - npu_command：NPU 健康检查命令；只检查该服务实际占用的卡，不检查同节点其他服务占用的卡，避免其他服务的卡故障误报本服务；卡号和数量取自该服务部署时的设备分配（如 --device 挂载的 davinci 卡号）；示例形态（服务占用 0、1 两张卡）：`test "$(npu-smi info | grep -cE '^\| +(0|1) .*OK')" -eq 2`；
 - log_check_command：可选的日志检查命令；命令退出码为 0 表示最近窗口没有匹配错误，非 0 表示发现日志错误或检查失败；不包含 KV connector 专用判断；
-- business_probe_command：可选的最小业务探针命令；命令退出码为 0 表示探针成功，非 0 表示业务探针失败；每个部署需在入口服务上配置一条：PD 分离部署为 Proxy 服务，经公共入口发出，一条请求穿过 Prefill、KV 传输和 Decode 全链路；普通多机为 master 服务，直连引擎 OpenAI API 端口；命令从本次部署验收实际执行成功的最小业务请求派生；
+- `business_probe_command` 在部署的入口服务上配置，使用本次验收通过的最小业务请求。普通多机直连 Master 的 OpenAI API，PD 分离经 Proxy 检查完整链路。非流式探针直接调用 `curl` 时，保留 JSON 正文供监控识别 `error`。
+- Agent 为 `readiness_command` 或 `business_probe_command` 生成直接调用 `curl` 的命令时，必须在命令数组中加入 `"--write-out", "\\nhttp=%{http_code}\\n"`，在标准输出的独立末行打印 HTTP 状态码。
 - depends_on：服务依赖，值可以是依赖服务的 service_id、container 或 recovery_group；上游事件处于 processing 时，下游软信号只记录、不重复通知 Agent；
 - recovery_scope：Agent 选择恢复范围时使用的部署事实。
 
 ### 3.3 清单变更与安全边界
 
-清单生成后，部署拓扑、容器、端口、设备或原始启动命令发生变化时必须重新生成清单并重启监控。监控进程只读清单，不在运行期间修改清单。
-
-命令字段只保存经过部署验收或已部署完成的服务提供的确认的检查命令。命令结果、凭据和完整日志写入部署运行目录或脱敏日志，不写入清单。
-
-Pi Extension 只在本机回环端口接收事件，并继续校验已登记的 deployment_key、incident_id 和事件路径；不得把该端口发布到外部网络。
+清单生成后，部署拓扑、容器、端口、设备或原始启动命令发生变化时必须重新生成清单并重启监控。监控进程只读清单，不在运行期间修改清单。命令字段只保存经过部署验收或已部署完成的服务提供的确认的检查命令。命令结果、凭据和完整日志写入部署运行目录或脱敏日志，不写入清单。Pi Extension 只在本机回环端口接收事件，并继续校验已登记的 deployment_key、incident_id 和事件路径；不得把该端口发布到外部网络。
 
 ## 4. 故障事件处理
 
@@ -150,16 +161,14 @@ processing
 recovered / recovered_degraded / failed / waiting_for_user
 ~~~
 
-监控事件是事实证据，不是最终故障结论。单次探测不足以支持高风险恢复时，先补充检查。
+`signals` 列出已确认信号。Agent 结合 `observation`、可用的 `last_observation` 和 `evidence` 复核。若有 `probe_results`，可查看失败原因和 HTTP 状态码。收到 `probe_execution_error` 时，查看检查项、`kind`、确认次数、退出码和 stderr，先复核检查命令或 SSH、Docker 链路。确认错误出在本次生成的命令时，按第 5.1.2 节修正并复跑。遇到 HTTP `4xx` 时，优先复核地址、认证、请求参数或限流，取得服务故障证据后再决定是否重启。监控事件是事实证据，不是最终故障结论。单次探测不足以支持高风险恢复时，先补充检查。
 
 事件文件由监控进程和 Agent 共同维护，但写入范围不同：
 
-- 监控进程首次发布事件时写入 `schema_version`、`incident_id`、`deployment_key`、`detected_at`、`service`、`node`、`recovery_group`、`affected_services`、`signals`、`evidence`、`evidence_dropped`、`confirmation_count`、`first_failed_at`、`observation`、`trigger`、`status` 和 `updated_at`，初始状态为 `detected`；同一 recovery_group 的后续探测只追加证据，不新建事件；
+- 监控进程首次发布事件时写入 `schema_version`、`incident_id`、`deployment_key`、`detected_at`、`service`、`node`、`recovery_group`、`affected_services`、`signals`、`evidence`、`evidence_dropped`、`confirmation_count`、`first_failed_at`、`observation`、`trigger`、`status` 和 `updated_at`，初始状态为 `detected`；
 - Agent 开始处理时将 `status` 改为 `processing`，并补充三个字段：`diagnosis`（故障判断及依据：结论、指向本事件 `evidence` 条目的证据引用、排除的假设）、`recovery`（恢复执行记录：选择的恢复策略与范围、实际执行的动作、SSH/Docker 操作及结果、是否使用备用节点）和 `validation`（验收记录：readiness、通信、模型身份和真实 completion 的逐项验收结果）；
-- Agent 完成验收后将 `status` 改为 `recovered`、`recovered_degraded`、`failed` 或 `waiting_for_user`，仍需用户处理的事项写入 `diagnosis`；`failed` 和 `waiting_for_user` 表示故障尚未解决：同组后续监控探测继续向该事件追加证据，不新建事件、不再次通知 Agent；仅当故障已解决，事件状态为 `recovered` 或 `recovered_degraded`后，同组再次出现故障才新建事件；
+- Agent 完成验收后将 `status` 改为 `recovered`、`recovered_degraded`、`failed` 或 `waiting_for_user`，仍需用户处理的事项写入 `diagnosis`。`failed` 和 `waiting_for_user` 表示故障尚未解决，同组同类事件继续追加证据。状态为 `recovered` 或 `recovered_degraded` 后，该类故障再次出现时会新建事件；
 - 监控进程不覆盖 Agent 已写入的处理和验收字段。
-
-容器退出、Docker 运行时错误、进程消失、SSH 不可达和 NPU 异常等硬信号单次确认即可上报；readiness、日志和业务探针等软信号需要连续三次探测失败后才上报，期间恢复则清零。
 
 Agent 开始恢复前必须先将主故障事件状态更新为 `processing`。在该状态期间，依赖该服务或恢复组的其他服务如果只出现 readiness、日志或业务探针等软信号，监控进程只将证据追加到主事件，不新建事件或再次通知 Agent。主事件恢复完成后，监控重新探测依赖服务；依赖服务仍异常时，再生成新的故障事件。依赖服务自身出现容器退出、SSH 不可达或 NPU 异常等硬信号时，仍可以单独上报。
 
@@ -178,14 +187,14 @@ Agent 开始恢复前必须先将主故障事件状态更新为 `processing`。�
 | Proxy 异常 | Proxy 进程退出、入口端口不可用或后端列表丢失 | 只重建 Proxy，保留健康的 P/D 和 KV 服务 | 真实请求仍失败时重新检查后端组 |
 | 网络或 SSH 不可达 | SSH、数据面 IP、通信端口或网卡连续不可达 | 连续确认后隔离故障端点并等待或迁移 | 节点持续不可达时迁移 |
 | NPU 或宿主机不健康 | npu-smi 健康异常、设备丢失、驱动或 HCCL 报错；SSH 失败、Docker/Ascend 运行时不可用或关键目录不可读 | 隔离故障设备或宿主机，不执行自动芯片 reset | 使用已预检的备用节点迁移；无备用节点时按本文件第 5.3 节自主执行降级恢复 |
-| 配置、镜像或模型错误 | 参数互斥、挂载缺失、镜像 digest 不一致、模型加载失败、端口冲突 | 停止自动重试，保留证据并报告 | 用户修正部署计划后重新部署 |
+| 命令、脚本、配置、镜像或模型错误 | 命令参数互斥、脚本缺陷、挂载或端口配置错误、镜像 digest 不一致或模型加载失败 | 能按第 5.1.2 节就地修正时，先修正再恢复 | 正确修正方案无法核实或需要变更用户确认的部署方案时，停止自动重试并报告 |
 | 资源耗尽 | OOM 证据、显存/内存分配失败或句柄耗尽的日志报错；资源水位本身无信号，依据后果和日志判定 | 可清理本次残留后按原配置重试一次 | 不得自动缩小并行规模；仍不足则迁移或报告失败 |
 
 Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原拓扑来伪造成功；只有满足第 5.3 节前置判定和执行约束的降级恢复可以改变拓扑，且终态必须为 recovered_degraded。
 
 ### 5.1 原地恢复
 
-优先原地恢复需要同时满足：
+在原节点恢复推理服务前，需同时确认以下条件。
 
 - SSH 和 Docker 可用；
 - NPU 设备健康且身份未改变；
@@ -193,11 +202,19 @@ Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原�
 - 故障不属于持续的节点、网络或 NPU 故障；
 - 不改变 TP、DP、PP、EP、rank 和服务拓扑。
 
-原地恢复必须使用 deployment_report.json 和 commands.log 中确认的镜像、设备、挂载、环境和原始启动参数；monitor-manifest.json 只提供持续监控所需的服务与检查命令。
+#### 5.1.1 可按原配置直接重启或重建
 
-- 同一恢复组内同类故障的自动恢复跨事件累计不超过 2 轮；每轮指一次以 `recovered` 或 `recovered_degraded` 结束的事件，诊断时读取 events/ 目录中的历史事件确认是否同类重现。第 2 轮后同类故障再次出现的，不再自动恢复，诊断分析出原因后，将状态改为 waiting_for_user，向用户报告证据和分析结论：反复重现说明恢复动作只消除了当次发作、未消除故障根因，继续同类动作没有新增收益。
-- 恢复动作执行后服务从未就绪时，该动作判定无效：不重复同类动作，按第 5 章表格升级处理。
-  
+确认已验收的配置和启动命令仍然适用，且故障出在运行实例时，Agent 按 `deployment_report.json` 和 `commands.log` 记录的镜像、设备、挂载、环境和启动参数重启或重建受影响的服务，再按第 4 章验收。`monitor-manifest.json` 仅提供监控所需的服务与检查命令。
+
+#### 5.1.2 需先修正再恢复
+
+确认命令、脚本或配置本身有误时，先根据用户给定的部署要求、已验收的部署记录或实机复核确定修正内容。Agent 可以在原部署约束内自行修正本次部署中由其编写或生成的错误项，或还原已验收的配置。无法核实正确修法，或者修正需要改变用户指定的值或部署约束时，保留证据并置为 `waiting_for_user`。确认第三方软件缺陷时按第 5.4 节处理。
+
+- 仅影响监控时，复跑并验证受影响的检查。修改监控清单或常驻监控脚本后，重启对应的监控单元并确认探测正常。
+- 影响推理服务时，在原节点用已验证的方式使修正生效。必要时重启或重建受影响的服务或恢复组，并按第 4 章验收。
+
+将修正内容和验证结果写入事件。若修正改变服务启动命令或部署配置，验收后更新 `deployment_report.json`，将实际执行的修正命令逐字追加到 `commands.log`，并按第 3.3 节同步监控清单。后续恢复使用验收通过的修正记录。
+
 ### 5.2 备用节点迁移
 
 以下情况可以迁移：
@@ -246,8 +263,8 @@ Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原�
 
 诊断结论指向第三方软件缺陷（vLLM-Ascend、CANN、驱动或依赖组件的缺陷，排除配置、资源和硬件原因）时：
 
-- 仍执行重启维持服务可用；检索不阻塞恢复动作和验收；
-- 重启完成后立即检索社区已有的对应 issue、修复版本、补丁或可行绕过方案，检索范围包括 vLLM-Ascend 与 CANN 的 issue 跟踪、版本发布说明和社区讨论；
+- 满足第 5.1 节的原地恢复条件时，先重启服务并验收。
+- 重启验收结束后立即检索社区已有的对应 issue、修复版本、补丁或可行绕过方案。无法执行重启时直接检索。检索范围包括 vLLM-Ascend 与 CANN 的 issue 跟踪、版本发布说明和社区讨论。
 - 检索结论写入 `diagnosis`，并向用户报告：对应的 issue 或缺陷报告、可用的修复或绕过方案、建议的处理路径；
 - 是否应用修复由用户裁决：应用补丁、升级版本或调整参数属于部署变更，按部署流程重新部署并按第 3.3 节重新生成清单；Agent 不在恢复动作内直接修改软件或其参数；
 
@@ -274,4 +291,3 @@ Pi会话崩溃或异常退出后，新开启的会话中用户要求恢复某部
 4. 等待监控在下一个重试周期内把未送达的事件推送进当前会话；
 5. 通过 SSH 对账 events/ 目录中全部未解决事件（status 为 detected、processing、waiting_for_user 或 failed），与已推送事件按 incident_id 去重：detected/processing 逐个按第 4 章流程处理；waiting_for_user/failed 只向用户提示存在待裁决或已放弃的事件，不重复进入恢复流程；
 6. 无未解决事件时向用户报告当前监控状态干净。
-   

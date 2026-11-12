@@ -12,10 +12,12 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import shlex
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -31,17 +33,42 @@ RESOLVED_STATES = {"recovered", "recovered_degraded"}
 MAX_EVIDENCE = 2000
 MAX_INCIDENT_EVIDENCE = 100
 SOFT_SIGNAL_CONFIRMATIONS = 3
+UNKNOWN_PROBE_CONFIRMATIONS = 3
+PROBE_EXECUTION_ERROR = "probe_execution_error"
+PROBE_EXECUTION_ERROR_KINDS = {
+    "command_execution_failed",
+    "curl_execution_failed",
+    "shell_syntax_error",
+}
+PERSISTENT_UNKNOWN_KINDS = {"command_timeout", "ssh_failed", "process_check_failed"}
 HARD_SIGNALS = {
     "ssh_unreachable",
     "container_exited",
+    "oom_killed",
     "docker_runtime_error",
     "process_missing",
     "npu_unhealthy",
 }
 SOFT_SIGNALS = {
+    "container_not_running",
     "readiness_failed",
     "service_log_error",
     "business_failed",
+}
+HTTP_STATUS_LINE = re.compile(r"^http=([1-5][0-9]{2})(?:\s|$)")
+SHELL_SYNTAX_ERROR = re.compile(
+    r"^(?:[^:\n]*/)?(?:sh|bash|dash|ash|ksh|zsh|[^:/\n]+\.sh): "
+    r"(?:-c: )?(?:(?:line )?\d+: )?(?:syntax error\b|unexpected EOF while looking for matching\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+CURL_FAILURES = {
+    6: "http_dns_failed",
+    7: "http_connect_failed",
+    18: "http_partial_response",
+    22: "http_error",
+    28: "http_timeout",
+    52: "http_empty_response",
+    56: "http_receive_failed",
 }
 
 
@@ -125,6 +152,8 @@ class RemoteExecutor:
                 str(exc.stderr or "") + " command timed out",
                 timed_out=True,
             )
+        except OSError as exc:
+            return CommandResult(-1, "", str(exc))
         return CommandResult(
             completed.returncode,
             completed.stdout,
@@ -145,7 +174,7 @@ def _host(service: Mapping[str, Any]) -> str:
 
 
 def _command(value: Any) -> list[str] | None:
-    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+    if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
         return None
     return value
 
@@ -179,6 +208,64 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
             )
 
 
+def _probe_details(
+    name: str, command: Sequence[str], result: CommandResult, elapsed_ms: int
+) -> dict[str, Any]:
+    outcome, kind = ("ok", "ok") if result.ok else ("failed", "check_failed")
+    http_status = None
+    if result.timed_out:
+        outcome, kind = "unknown", "command_timeout"
+    elif result.returncode == 255:
+        outcome, kind = "unknown", "ssh_failed"
+    elif result.returncode < 0 or result.returncode in {126, 127}:
+        outcome, kind = "unknown", "command_execution_failed"
+    elif not result.ok and SHELL_SYNTAX_ERROR.search(result.stderr):
+        outcome, kind = "unknown", "shell_syntax_error"
+    elif name in {"readiness", "business_probe"} and command[0].rsplit("/", 1)[-1] == "curl":
+        body = result.stdout
+        # Only interpret an explicit curl write-out marker, not a response body or log line.
+        if any(
+            option in {"-w", "--write-out"} and "http=%{http_code}" in fmt
+            for option, fmt in zip(command, command[1:])
+        ):
+            before_status, _, last_line = body.rstrip().rpartition("\n")
+            match = HTTP_STATUS_LINE.match(last_line)
+            if match:
+                http_status = int(match[1])
+                body = before_status
+        if result.returncode in {0, 22} and http_status is not None and http_status >= 400:
+            outcome, kind = "failed", "http_5xx" if http_status >= 500 else "http_4xx"
+        elif result.returncode in {1, 2, 3, 4, 23, 26, 27, 48, 77}:
+            outcome, kind = "unknown", "curl_execution_failed"
+        elif not result.ok:
+            kind = CURL_FAILURES.get(result.returncode, "http_check_failed")
+        elif name == "business_probe":
+            try:
+                response = json.loads(body)
+            except (ValueError, RecursionError):
+                response = None
+            if isinstance(response, dict) and response.get("error") is not None:
+                outcome, kind = "failed", "business_response_error"
+    elif name == "process" and not result.ok:
+        # A failed docker top cannot prove absence. For docker exec, only a clean
+        # negative check (e.g. pgrep exiting 1) is evidence of a missing process.
+        if command[1] != "exec" or result.returncode != 1 or result.stderr.strip():
+            outcome, kind = "unknown", "process_check_failed"
+        else:
+            kind = "process_not_found"
+    elif name == "npu" and not npu_health_ok(result.stdout, result.returncode):
+        outcome, kind = "failed", "npu_check_failed"
+    detail = {
+        "outcome": outcome,
+        "kind": kind,
+        "returncode": result.returncode,
+        "elapsed_ms": elapsed_ms,
+    }
+    if http_status is not None:
+        detail["http_status"] = http_status
+    return detail
+
+
 def _service_probe(
     executor: RemoteExecutor,
     service: Mapping[str, Any],
@@ -186,6 +273,7 @@ def _service_probe(
     service_id = str(service.get("service_id") or service.get("container") or "unknown")
     host = _host(service)
     container = str(service.get("container") or "")
+    probe_results: dict[str, dict[str, Any]] = {}
     observation: dict[str, Any] = {
         "service_id": service_id,
         "host": host,
@@ -197,6 +285,7 @@ def _service_probe(
         "npu_healthy": None,
         "log_error": None,
         "business_ok": None,
+        "probe_results": probe_results,
     }
     evidence: list[str] = []
 
@@ -204,8 +293,27 @@ def _service_probe(
         observation["probe_error"] = "manifest missing host or container"
         return observation, ["manifest_missing_host_or_container"]
 
-    inspect = executor.run(
-        host,
+    def run_probe(name: str, command: Sequence[str]) -> CommandResult:
+        start = time.monotonic()
+        result = executor.run(host, command)
+        detail = _probe_details(name, command, result, int((time.monotonic() - start) * 1000))
+        probe_results[name] = detail
+        status = f" http={detail['http_status']}" if "http_status" in detail else ""
+        summary = f"{name}: {detail['kind']} rc={result.returncode}{status}"
+        output = result.stdout or result.stderr
+        if (
+            detail["outcome"] != "ok"
+            and detail["kind"] != "business_response_error"
+            and result.stderr
+        ):
+            output = result.stderr
+        evidence.append(f"{summary} {truncate(output)}".rstrip())
+        if detail["outcome"] == "unknown":
+            LOGGER.warning("inconclusive probe for %s (%s): %s", service_id, host, summary)
+        return result
+
+    inspect = run_probe(
+        "docker_inspect",
         [
             "docker",
             "inspect",
@@ -214,54 +322,37 @@ def _service_probe(
             container,
         ],
     )
-    if inspect.returncode == 255:
+    inspect_details = probe_results["docker_inspect"]
+    if inspect_details["kind"] == "ssh_failed":
         observation["ssh_reachable"] = False
-        observation["container_status"] = "unknown"
-        evidence.append("ssh_unreachable: " + truncate(inspect.stderr))
         return observation, evidence
 
-    if inspect.returncode != 0:
-        missing = "no such object" in (inspect.stderr + inspect.stdout).lower()
+    if inspect_details["outcome"] == "unknown":
+        observation["ssh_reachable"] = None
+    elif not inspect.ok:
+        error = (inspect.stderr + inspect.stdout).lower()
+        missing = "no such object" in error or "no such container" in error
         observation["container_status"] = "not_found" if missing else "docker_runtime_error"
-        evidence.append("docker_inspect: " + truncate(inspect.stderr or inspect.stdout))
     else:
         parts = inspect.stdout.strip().split("\t")
         observation["container_status"] = parts[0] if parts else "unknown"
         observation["oom_killed"] = len(parts) > 1 and parts[1].lower() == "true"
         observation["exit_code"] = parts[2] if len(parts) > 2 else ""
-        evidence.append("docker_inspect: " + truncate(inspect.stdout))
 
-    process_command = _command(service.get("process_check_command"))
-    if process_command is not None:
-        process = executor.run(host, process_command)
-        observation["process_present"] = process.ok
-        evidence.append("process: " + truncate(process.stdout or process.stderr))
-    else:
-        evidence.append("process: missing process_check_command")
-
-    readiness_command = _command(service.get("readiness_command"))
-    if readiness_command is not None:
-        readiness = executor.run(host, readiness_command)
-        observation["readiness_ok"] = readiness.ok
-        evidence.append("readiness: " + truncate(readiness.stdout or readiness.stderr))
-
-    npu_command = _command(service.get("npu_command"))
-    if npu_command is not None:
-        npu = executor.run(host, npu_command)
-        observation["npu_healthy"] = npu_health_ok(npu.stdout, npu.returncode)
-        evidence.append("npu: " + truncate(npu.stdout or npu.stderr))
-
-    log_command = _command(service.get("log_check_command"))
-    if log_command is not None:
-        log_check = executor.run(host, log_command)
-        observation["log_error"] = not log_check.ok
-        evidence.append("log_check: " + truncate(log_check.stdout or log_check.stderr))
-
-    business_command = _command(service.get("business_probe_command"))
-    if business_command is not None:
-        business = executor.run(host, business_command)
-        observation["business_ok"] = business.ok
-        evidence.append("business_probe: " + truncate(business.stdout or business.stderr))
+    for name, command_key, observation_key in (
+        ("process", "process_check_command", "process_present"),
+        ("readiness", "readiness_command", "readiness_ok"),
+        ("npu", "npu_command", "npu_healthy"),
+        ("log_check", "log_check_command", "log_error"),
+        ("business_probe", "business_probe_command", "business_ok"),
+    ):
+        command = _command(service.get(command_key))
+        if command is None or (name == "process" and observation["container_status"] != "running"):
+            continue
+        run_probe(name, command)
+        outcome = probe_results[name]["outcome"]
+        if outcome != "unknown":
+            observation[observation_key] = outcome == ("failed" if name == "log_check" else "ok")
 
     return observation, evidence
 
@@ -272,6 +363,10 @@ def _signals(observation: Mapping[str, Any]) -> list[str]:
         signals.append("ssh_unreachable")
     if observation.get("container_status") in {"exited", "created", "dead", "not_found"}:
         signals.append("container_exited")
+    if observation.get("container_status") in {"paused", "restarting"}:
+        signals.append("container_not_running")
+    if observation.get("oom_killed") is True:
+        signals.append("oom_killed")
     if observation.get("container_status") == "docker_runtime_error":
         signals.append("docker_runtime_error")
     if observation.get("process_present") is False:
@@ -284,6 +379,11 @@ def _signals(observation: Mapping[str, Any]) -> list[str]:
         signals.append("service_log_error")
     if observation.get("business_ok") is False:
         signals.append("business_failed")
+    if any(
+        detail["kind"] in PROBE_EXECUTION_ERROR_KINDS
+        for detail in observation.get("probe_results", {}).values()
+    ):
+        signals.append(PROBE_EXECUTION_ERROR)
     return signals
 
 
@@ -294,6 +394,8 @@ def _incident_path(events_dir: Path, incident_id: str) -> Path:
 def _find_open_incident(
     events_dir: Path,
     recovery_group: str,
+    *,
+    probe_only: bool = False,
 ) -> Path | None:
     # Unresolved incidents (anything but resolved states) are append targets:
     # the monitor never opens a duplicate incident or re-notifies the Agent
@@ -307,6 +409,8 @@ def _find_open_incident(
         if not isinstance(item, dict):
             continue
         if item.get("status") in RESOLVED_STATES:
+            continue
+        if (item.get("signals") == [PROBE_EXECUTION_ERROR]) != probe_only:
             continue
         item_group = item.get("recovery_group") or item.get("service")
         if item_group != recovery_group:
@@ -401,12 +505,13 @@ def build_incident(
     service: Mapping[str, Any],
     observation: Mapping[str, Any],
     evidence: Sequence[str],
+    *,
+    signals: Sequence[str],
     event: Mapping[str, Any] | None = None,
     confirmation_count: int = 1,
     first_failed_at: str | None = None,
 ) -> dict[str, Any]:
     incident_id = "incident-" + uuid.uuid4().hex
-    signals = _signals(observation)
     detected_at = utc_now()
     return {
         "schema_version": 1,
@@ -417,7 +522,7 @@ def build_incident(
         "node": service.get("host"),
         "recovery_group": _recovery_group(service),
         "affected_services": [service.get("service_id") or service.get("container")],
-        "signals": signals,
+        "signals": list(signals),
         "evidence": [
             {
                 "kind": "monitor_probe",
@@ -534,6 +639,7 @@ class Monitor:
         self.watchers: list[DockerEventWatcher] = []
         self.soft_failure_counts: dict[tuple[str, str], int] = {}
         self.soft_failure_first_seen: dict[tuple[str, str], str] = {}
+        self.unknown_probe_streaks: dict[str, dict[str, tuple[int, str]]] = {}
         self.reporter = threading.Thread(
             target=self._report_loop,
             name="pi-http-reporter",
@@ -636,6 +742,8 @@ class Monitor:
             item = read_json(path, {})
             if not isinstance(item, dict) or item.get("status") != "processing":
                 continue
+            if item.get("signals") == [PROBE_EXECUTION_ERROR]:
+                continue
             group = str(item.get("recovery_group") or item.get("service") or "")
             if group in dependencies:
                 incident_id = str(item.get("incident_id") or path.stem)
@@ -669,14 +777,81 @@ class Monitor:
 
         return sorted(set(confirmed)), confirmation_count, first_failed_at
 
+    def _confirm_unknown_probes(
+        self,
+        service: Mapping[str, Any],
+        probe_results: Mapping[str, Mapping[str, Any]],
+        *,
+        periodic: bool,
+    ) -> dict[str, tuple[int, str]]:
+        service_id = str(service.get("service_id") or service.get("container") or "unknown")
+        previous = self.unknown_probe_streaks.get(service_id, {})
+        if not periodic:
+            for name, detail in probe_results.items():
+                if detail["outcome"] != "unknown":
+                    previous.pop(name, None)
+            return {}
+
+        # Rebuild each round so a skipped check breaks the consecutive streak.
+        current: dict[str, tuple[int, str]] = {}
+        now = utc_now()
+        for name, detail in probe_results.items():
+            kind = detail["kind"]
+            if kind not in PERSISTENT_UNKNOWN_KINDS:
+                continue
+            if name == "docker_inspect" and kind == "ssh_failed":
+                continue  # The first SSH failure already has a hard signal.
+            count, first_seen = previous.get(name, (0, now))
+            current[name] = (count + 1, first_seen)
+
+        if current:
+            self.unknown_probe_streaks[service_id] = current
+        else:
+            self.unknown_probe_streaks.pop(service_id, None)
+        return {
+            name: streak for name, streak in current.items()
+            if streak[0] >= UNKNOWN_PROBE_CONFIRMATIONS
+        }
+
     def probe(self, service: Mapping[str, Any], trigger: Mapping[str, Any] | None) -> None:
         observation, evidence = _service_probe(self.executor, service)
         observed_signals = _signals(observation)
         signals, confirmation_count, first_failed_at = self.confirm_signals(
             service, observed_signals
         )
-        if not signals:
-            return
+        if signals:
+            self._record_incident(
+                service, observation, evidence, trigger, signals, confirmation_count, first_failed_at
+            )
+        unknown_probes = self._confirm_unknown_probes(
+            service, observation["probe_results"], periodic=trigger is None
+        )
+        if PROBE_EXECUTION_ERROR in observed_signals or unknown_probes:
+            for name in unknown_probes:
+                evidence.append(
+                    f"{name}: inconclusive for at least {UNKNOWN_PROBE_CONFIRMATIONS} "
+                    "consecutive periodic checks"
+                )
+            self._record_incident(
+                service,
+                observation,
+                evidence,
+                trigger,
+                [PROBE_EXECUTION_ERROR],
+                max((count for count, _ in unknown_probes.values()), default=1),
+                min((first_seen for _, first_seen in unknown_probes.values()), default=None),
+            )
+
+    def _record_incident(
+        self,
+        service: Mapping[str, Any],
+        observation: Mapping[str, Any],
+        evidence: Sequence[str],
+        trigger: Mapping[str, Any] | None,
+        signals: list[str],
+        confirmation_count: int,
+        first_failed_at: str | None,
+    ) -> None:
         service_id = str(service.get("service_id") or service.get("container"))
         recovery_group = _recovery_group(service)
         if set(signals).issubset(SOFT_SIGNALS):
@@ -693,7 +868,9 @@ class Monitor:
                     suppressed_by=dependency_incident[1],
                 )
                 return
-        existing = _find_open_incident(self.events_dir, recovery_group)
+        existing = _find_open_incident(
+            self.events_dir, recovery_group, probe_only=signals == [PROBE_EXECUTION_ERROR]
+        )
         if existing is not None:
             append_incident_evidence(
                 existing,
@@ -710,9 +887,10 @@ class Monitor:
             service,
             observation,
             evidence,
-            trigger,
-            confirmation_count,
-            first_failed_at,
+            signals=signals,
+            event=trigger,
+            confirmation_count=confirmation_count,
+            first_failed_at=first_failed_at,
         )
         path = _incident_path(self.events_dir, incident["incident_id"])
         atomic_write_json(path, incident)
@@ -805,13 +983,18 @@ class Monitor:
         self.probe_all()
         self.write_state("running")
         interval = float(self.manifest.get("probe_interval_seconds", 30))
+        next_probe_at = time.monotonic() + interval
         try:
             while not self.stop_event.is_set():
                 try:
-                    event = self.probe_events.get(timeout=interval)
-                    self.handle_runtime_event(event)
+                    event = self.probe_events.get(timeout=max(0, next_probe_at - time.monotonic()))
                 except queue.Empty:
+                    pass
+                else:
+                    self.handle_runtime_event(event)
+                if time.monotonic() >= next_probe_at and not self.stop_event.is_set():
                     self.probe_all()
+                    next_probe_at = time.monotonic() + interval
         finally:
             self.stop_watchers()
             self.reporter.join(timeout=5)
