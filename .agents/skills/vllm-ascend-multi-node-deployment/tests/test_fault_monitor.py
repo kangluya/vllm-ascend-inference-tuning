@@ -1,10 +1,17 @@
+import json
+import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from scripts.vllm_fault_monitor import (
     CommandResult,
+    GATEWAY_API_KEY_ENV,
+    GATEWAY_AUTO_DISABLED,
+    GATEWAY_USER_ID_ENV,
+    GatewayClient,
     Monitor,
     RemoteExecutor,
     atomic_write_json,
@@ -610,6 +617,299 @@ class FaultMonitorTests(unittest.TestCase):
             atomic_write_json(path, {"status": "running"})
             self.assertEqual(read_json(path, {}), {"status": "running"})
             self.assertFalse(path.with_name(".state.json.unknown.tmp").exists())
+
+
+class GatewayIntegrationTests(unittest.TestCase):
+    def service(self):
+        return {
+            "service_id": "proxy-0",
+            "host": "node-a",
+            "container": "proxy-0",
+            "recovery_group": "pd-serving-group",
+            "process_check_command": [
+                "docker",
+                "exec",
+                "proxy-0",
+                "pgrep",
+                "-af",
+                "proxy",
+            ],
+        }
+
+    def make_monitor(self, directory: str) -> Monitor:
+        path = Path(directory) / "monitor-manifest.json"
+        atomic_write_json(
+            path,
+            {
+                "deployment_key": "deployment-1",
+                "services": [self.service()],
+                "gateway": {
+                    "enabled": True,
+                    "base_url": "http://gateway:3000",
+                    "poll_interval_seconds": 5,
+                    "deployments": [
+                        {
+                            "gateway_deployment_id": "deployment-d1",
+                            "service_id": "proxy-0",
+                            "recovery_group": "pd-serving-group",
+                        }
+                    ],
+                },
+            },
+        )
+        return Monitor(path)
+
+    def models_event(
+        self,
+        *,
+        enabled: bool = False,
+        auto_disabled: bool = True,
+        updated_at: str = "2026-11-13 10:00:00+00",
+    ):
+        return {
+            "models": [
+                {
+                    "deployment_id": "deployment-d1",
+                    "model_name": "model-a",
+                    "api_base": "http://node-a:8000/v1?token=must-not-be-recorded",
+                    "enabled": enabled,
+                    "auto_disabled": auto_disabled,
+                    "updated_at": updated_at,
+                }
+            ]
+        }
+
+    def test_gateway_manifest_is_optional_and_rejects_embedded_credentials(self) -> None:
+        validate_manifest({"services": [self.service()]})
+        manifest = {
+            "services": [self.service()],
+            "gateway": {
+                "base_url": "http://gateway:3000",
+                "api_key": "secret",
+                "deployments": [
+                    {
+                        "gateway_deployment_id": "deployment-d1",
+                        "service_id": "proxy-0",
+                    }
+                ],
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "credentials"):
+            validate_manifest(manifest)
+
+    def test_start_watchers_keeps_docker_watcher_and_adds_gateway_watcher(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = self.make_monitor(directory)
+            with patch("scripts.vllm_fault_monitor.DockerEventWatcher") as docker_watcher, patch(
+                "scripts.vllm_fault_monitor.GatewayWatcher"
+            ) as gateway_watcher:
+                monitor.start_watchers()
+            docker_watcher.assert_called_once()
+            gateway_watcher.assert_called_once()
+            docker_watcher.return_value.start.assert_called_once()
+            gateway_watcher.return_value.start.assert_called_once()
+
+    def test_auto_disabled_creates_one_deduplicated_gateway_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = self.make_monitor(directory)
+            event = self.models_event()
+            monitor.handle_gateway_models(event)
+            path = monitor.report_queue.get_nowait()
+            incident = read_json(path, {})
+            self.assertEqual(incident["signals"], [GATEWAY_AUTO_DISABLED])
+            self.assertEqual(incident["observation"]["auto_disable_cause"], "unknown")
+            self.assertEqual(
+                incident["observation"]["api_base"], "http://node-a:8000/v1"
+            )
+            self.assertEqual(len(incident["gateway_episodes"]), 1)
+            self.assertEqual(incident["evidence"][0]["kind"], "gateway_models")
+
+            monitor.handle_gateway_models(event)
+            self.assertTrue(monitor.report_queue.empty())
+            self.assertEqual(len(read_json(path, {})["evidence"]), 1)
+
+    def test_gateway_signal_merges_into_existing_local_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = self.make_monitor(directory)
+            incident = build_incident(
+                monitor.manifest,
+                self.service(),
+                {"container_status": "exited"},
+                ["container exited"],
+                signals=["container_exited"],
+            )
+            path = monitor.events_dir / f"{incident['incident_id']}.json"
+            atomic_write_json(path, incident)
+
+            monitor.handle_gateway_models(self.models_event())
+
+            self.assertTrue(monitor.report_queue.empty())
+            updated = read_json(path, {})
+            self.assertEqual(
+                updated["signals"], ["container_exited", GATEWAY_AUTO_DISABLED]
+            )
+            self.assertEqual(updated["evidence"][-1]["kind"], "gateway_models")
+
+    def test_local_signal_merges_into_gateway_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = self.make_monitor(directory)
+            monitor.handle_gateway_models(self.models_event())
+            path = monitor.report_queue.get_nowait()
+
+            monitor._record_incident(
+                self.service(),
+                {"container_status": "exited"},
+                ["container exited"],
+                None,
+                ["container_exited"],
+                1,
+                None,
+            )
+
+            self.assertTrue(monitor.report_queue.empty())
+            self.assertEqual(
+                read_json(path, {})["signals"],
+                ["container_exited", GATEWAY_AUTO_DISABLED],
+            )
+
+    def test_rejoin_closes_episode_and_later_auto_disable_is_new_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = self.make_monitor(directory)
+            monitor.handle_gateway_models(self.models_event())
+            first_path = monitor.report_queue.get_nowait()
+
+            monitor.handle_gateway_models(
+                self.models_event(
+                    enabled=True,
+                    auto_disabled=False,
+                    updated_at="2026-11-13 10:05:00+00",
+                )
+            )
+            first = read_json(first_path, {})
+            self.assertIn("gateway_rejoined_at", first)
+            self.assertEqual(
+                set(first["gateway_rejoined_episodes"]),
+                set(first["gateway_episodes"]),
+            )
+            first["status"] = "recovered"
+            atomic_write_json(first_path, first)
+
+            monitor.handle_gateway_models(
+                self.models_event(updated_at="2026-11-13 11:00:00+00")
+            )
+            second_path = monitor.report_queue.get_nowait()
+            self.assertNotEqual(first_path, second_path)
+
+    def test_gateway_observer_error_requires_three_failures_and_stays_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = self.make_monitor(directory)
+            failure = {
+                "kind": "gateway_auth_failed",
+                "message": "Gateway returned HTTP 401",
+            }
+            monitor.handle_gateway_error(failure)
+            monitor.handle_gateway_error(failure)
+            self.assertTrue(monitor.report_queue.empty())
+            monitor.handle_gateway_error(failure)
+            probe_path = monitor.report_queue.get_nowait()
+            probe_incident = read_json(probe_path, {})
+            self.assertEqual(probe_incident["signals"], ["probe_execution_error"])
+            self.assertEqual(probe_incident["confirmation_count"], 3)
+
+            monitor.handle_gateway_models(self.models_event())
+            service_path = monitor.report_queue.get_nowait()
+            self.assertNotEqual(probe_path, service_path)
+            self.assertEqual(read_json(service_path, {})["signals"], [GATEWAY_AUTO_DISABLED])
+
+    def test_missing_gateway_deployment_requires_three_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = self.make_monitor(directory)
+            for _ in range(2):
+                monitor.handle_gateway_models({"models": []})
+                self.assertTrue(monitor.report_queue.empty())
+            monitor.handle_gateway_models({"models": []})
+            incident = read_json(monitor.report_queue.get_nowait(), {})
+            self.assertEqual(incident["signals"], ["probe_execution_error"])
+            detail = incident["observation"]["probe_results"]["gateway_models"]
+            self.assertEqual(detail["kind"], "gateway_deployment_missing")
+
+    def test_gateway_client_only_calls_login_and_models(self) -> None:
+        class JsonResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps(self.payload).encode("utf-8")
+
+        client = GatewayClient("http://gateway:3000")
+        client.opener = Mock()
+        client.opener.open.side_effect = [
+            JsonResponse({"ok": True}),
+            JsonResponse({"models": [{"deployment_id": "deployment-d1"}]}),
+        ]
+        with patch.dict(
+            os.environ,
+            {
+                GATEWAY_API_KEY_ENV: "secret",
+                GATEWAY_USER_ID_ENV: "admin",
+            },
+            clear=False,
+        ):
+            models = client.list_models()
+
+        self.assertEqual(models[0]["deployment_id"], "deployment-d1")
+        requests = [call.args[0] for call in client.opener.open.call_args_list]
+        self.assertEqual(
+            [request.full_url for request in requests],
+            [
+                "http://gateway:3000/dashboard/api/auth/login",
+                "http://gateway:3000/dashboard/api/admin/models",
+            ],
+        )
+        self.assertEqual(
+            json.loads(requests[0].data.decode("utf-8")),
+            {"user_id": "admin", "api_key": "secret"},
+        )
+
+    def test_gateway_client_reauthenticates_once_after_401(self) -> None:
+        class JsonResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps(self.payload).encode("utf-8")
+
+        client = GatewayClient("http://gateway:3000")
+        client.opener = Mock()
+        client.opener.open.side_effect = [
+            JsonResponse({"ok": True}),
+            urllib.error.HTTPError(
+                "http://gateway:3000/dashboard/api/admin/models",
+                401,
+                "Unauthorized",
+                {},
+                None,
+            ),
+            JsonResponse({"ok": True}),
+            JsonResponse({"models": []}),
+        ]
+        with patch.dict(os.environ, {GATEWAY_API_KEY_ENV: "secret"}, clear=False):
+            self.assertEqual(client.list_models(), [])
+        self.assertEqual(client.opener.open.call_count, 4)
 
 
 if __name__ == "__main__":

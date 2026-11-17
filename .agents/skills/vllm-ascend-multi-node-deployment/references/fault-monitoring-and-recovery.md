@@ -1,6 +1,6 @@
 # 故障监控与恢复
 
-本文件供 vLLM 多机部署服务使用：部署验收通过后或直接接入已有部署时，按本文件初始化故障监控（第 1-3 章），故障事件到达当前 Pi 后按本文件执行复核、恢复和验收（第 4-5 章），用户要求停止服务时按第 6 章执行，Pi 会话结束或崩溃后按第 7 章恢复监控接管。监控进程只负责探测和 HTTP 上报，不执行恢复动作；Agent 负责监控初始化、复核、判断、恢复、验收和停止。
+本文件供 vLLM 多机部署服务使用：部署验收通过后或直接接入已有部署时，按本文件初始化故障监控（第 1-3 章），故障事件到达当前 Pi 后按本文件执行复核、恢复和验收（第 4-5 章），用户要求停止服务时按第 6 章执行，Pi 会话结束或崩溃后按第 7 章恢复监控接管。监控进程只负责探测和 HTTP 上报，不执行恢复动作；Agent 负责监控初始化、复核、判断、恢复、验收和停止。接入 Boom Gateway 时，现有 Docker、进程、NPU、readiness、日志和业务探针全部保留，Gateway 只作为额外的摘流状态来源。
 
 ## 1. 监控初始化
 
@@ -23,11 +23,12 @@
 
 执行本节前必须满足以下任一条件：本次新部署已经通过部署验收，或者已有部署已经完成第 1.2 节的核对、记录和接入验收。满足条件后按以下顺序初始化监控：
 
-1. 生成 monitor-manifest.json，包含 deployment_key、control_host、监控进程可送达的 agent_notify endpoint（字段规则见第 3.2 节）、探测周期，以及每个服务的节点、容器、recovery_group、基于实机进程身份生成的必填容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；端口、设备、挂载、环境变量和完整部署命令继续记录在 deployment_report.json 与 commands.log；monitor-manifest.json 的字段契约见本文件第 3 章；
+1. 生成 monitor-manifest.json，包含 deployment_key、control_host、监控进程可送达的 agent_notify endpoint（字段规则见第 3.2 节）、探测周期，以及每个服务的节点、容器、recovery_group、基于实机进程身份生成的必填容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；需要接入 Gateway 时，额外配置第 3.2 节的可选 `gateway` 映射，不删除或关闭原有服务探针；端口、设备、挂载、环境变量和完整部署命令继续记录在 deployment_report.json 与 commands.log；monitor-manifest.json 的字段契约见本文件第 3 章；
 2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；从控制宿主机侧请求 agent_notify 端点的健康检查接口（同机时即本地请求；不同机时通过 SSH 在控制宿主机上请求）确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功；确认失败时停止流程，不得启动监控单元；
-3. 将 Skill 中的 `scripts/vllm_fault_monitor.py` 通过 SSH 复制到控制宿主机的 `/data/boom/deployment/vllm_fault_monitor.py`，并设置为可执行；只有路由确认成功且脚本复制完成后，才能注册并启动本次部署的 systemd 监控单元；
-4. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
-5. 监控进程通过 HTTP 向 Pi Extension 的 /v1/fault-events 上报事件。
+3. 配置 Gateway 增强时，从控制宿主机验证 Gateway 管理地址可达、管理员认证有效，并通过 `/dashboard/api/admin/models` 确认每个 `gateway_deployment_id` 唯一存在且映射到正确的入口服务；认证信息只放入 systemd credential 或权限受限的环境文件，不写入清单；验证失败时保留原有探针配置并停止 Gateway 增强的接入，不得带着错误映射启动；
+4. 将 Skill 中的 `scripts/vllm_fault_monitor.py` 通过 SSH 复制到控制宿主机的 `/data/boom/deployment/vllm_fault_monitor.py`，并设置为可执行；只有路由确认成功且脚本复制完成后，才能注册并启动本次部署的 systemd 监控单元；
+5. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
+6. 监控进程通过 HTTP 向 Pi Extension 的 /v1/fault-events 上报事件。
 
 ## 2. systemd 监控单元
 
@@ -43,6 +44,16 @@ KillMode=control-group
 ~~~
 
 Agent 必须先完成 deployment_key 路由登记再启动 systemd 单元。监控进程启动后自行写入 monitor-state.json，其中包括 deployment_key、清单绝对路径、PID/PGID、启动时间和命令身份。Agent 只读取这些字段。用户主动停止时先停止该单元，防止 systemd 自动重新拉起监控进程，再使用 monitor-state.json 校验并精确处理当前进程。
+
+配置 Gateway 增强时，推荐给上述单元增加受保护的 systemd credential：
+
+~~~ini
+[Service]
+LoadCredential=boom_gateway_admin_api_key:/etc/boom/credentials/gateway-admin-api-key
+Environment=VLLM_GATEWAY_ADMIN_USER_ID=admin
+~~~
+
+脚本会从 systemd 提供的 `$CREDENTIALS_DIRECTORY/boom_gateway_admin_api_key` 读取管理员 API key。也可以使用 `VLLM_GATEWAY_ADMIN_API_KEY_FILE` 指向权限受限的凭据文件；仅在运行环境本身已提供安全注入时使用 `VLLM_GATEWAY_ADMIN_API_KEY`。这些变量都不得写入 monitor-manifest.json、incident 或普通日志。
 
 ## 3. 监控清单契约（monitor-manifest.json）
 
@@ -77,7 +88,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
         "exec",
         "decode-0",
         "sh",
-        "-lc",
+        "-c",
         "pgrep -af '<verified-process-pattern>'"
       ],
       "readiness_command": [
@@ -95,7 +106,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
       ],
       "npu_command": [
         "sh",
-        "-lc",
+        "-c",
         "test \"$(npu-smi info | grep -cE '^\\| +(0|1) .*OK')\" -eq 2"
       ],
       "log_check_command": [
@@ -112,6 +123,26 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 
 ### 3.2 字段规则
 
+Gateway 增强是可选项。需要接入时，在上述清单顶层增加：
+
+~~~json
+{
+  "gateway": {
+    "enabled": true,
+    "base_url": "http://gateway-host:3000",
+    "poll_interval_seconds": 5,
+    "request_timeout_seconds": 5,
+    "deployments": [
+      {
+        "gateway_deployment_id": "deployment-d1",
+        "service_id": "decode-0",
+        "recovery_group": "decode-group"
+      }
+    ]
+  }
+}
+~~~
+
 - schema_version：清单格式版本；
 - deployment_key：本次部署的稳定标识，用于把事件路由到当前 Pi 会话；
 - deployment_dir：控制宿主机上的部署目录；
@@ -119,13 +150,18 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 - agent_notify.endpoint：监控进程向 Pi Extension 上报事件的 HTTP 地址，必须是监控进程可送达的地址：监控与 Pi 同机时为本机回环；不同机时，由 Pi 所在机器通过 SSH 反向隧道把 Extension 的监听端口落到控制宿主机回环（endpoint 仍为回环形态），或在防火墙白名单限制下直连 Pi 所在机器。Extension 的监听地址和端口由环境变量 VLLM_FAULT_NOTIFY_HOST（默认 127.0.0.1）和 VLLM_FAULT_NOTIFY_PORT（默认 8765）控制；通知接口无认证，除上述形态外不得暴露到网络；
 - probe_timeout_seconds：单次 SSH 或检查命令的最长等待时间；
 - `probe_interval_seconds` 控制全量巡检周期。Docker 事件触发对应服务的额外检查；
+- `gateway` 是可选增强配置；省略或将 `gateway.enabled` 设为 `false` 时，监控完全按原有内部探针运行；启用后也不会停止任何现有探针；
+- `gateway.base_url` 是控制宿主机可访问的 Boom Gateway origin，只允许不含路径、用户名、密码、查询参数和 fragment 的绝对 HTTP(S) 地址；
+- `gateway.poll_interval_seconds` 控制 `/dashboard/api/admin/models` 的轮询周期，`gateway.request_timeout_seconds` 控制单次管理请求等待时间，两者都必须大于 0；
+- `gateway.deployments` 使用 `gateway_deployment_id` 将 Gateway deployment 精确映射到现有 `service_id`；配置的 `recovery_group` 必须与该服务自身恢复组一致。不得只用 `model_name` 映射；
+- Gateway 管理员凭据只从 `VLLM_GATEWAY_ADMIN_API_KEY`、`VLLM_GATEWAY_ADMIN_API_KEY_FILE` 或 systemd credential `boom_gateway_admin_api_key` 读取；管理员 ID 使用 `VLLM_GATEWAY_ADMIN_USER_ID`，默认 `admin`；
 - services：本次部署中需要持续观察的服务；
 - service_id：服务稳定标识；
 - role：服务角色，例如 master、worker、prefill、decode、proxy 或 mooncake；
 - host：服务所在目标宿主机的 SSH 目标；
 - container：精确容器名；
 - recovery_group：最小恢复单元的稳定标识；同一 rank 组或角色组应使用相同值；单服务使用自身 service_id；
-- `process_check_command` 是必填的容器内进程检查命令数组，以 `docker exec <container>` 或 `docker top <container>` 开头。监控进程通过 SSH 在目标宿主机执行该命令。将 `<verified-process-pattern>` 替换为本次部署实机核实的模型路径和参数。使用 `docker exec` 检查时，未找到匹配进程应返回 `1`，且 stderr 为空；
+- `process_check_command` 是必填的容器内进程检查命令数组，以 `docker exec <container>` 或 `docker top <container>` 开头。监控进程通过 SSH 在目标宿主机执行该命令。将 `<verified-process-pattern>` 替换为本次部署实机核实的模型路径和参数。使用 `pgrep -f` 时，搜索表达式会出现在探针自身的命令行中，必须把其中一个有辨识度的字符改写为等价字符类以避免自匹配，例如将真实进程特征 `w8a8` 写成 `w8a[8]`：该正则仍能匹配真实的 `w8a8`，但不会匹配探针命令行中的字面量 `w8a[8]`。使用 `docker exec` 检查时，未找到匹配进程应返回 `1`，且 stderr 为空；
 - `readiness_command` 只对自身监听 API 端口的服务配置，使用部署验收通过的命令；
 - npu_command：NPU 健康检查命令；只检查该服务实际占用的卡，不检查同节点其他服务占用的卡，避免其他服务的卡故障误报本服务；卡号和数量取自该服务部署时的设备分配（如 --device 挂载的 davinci 卡号）；示例形态（服务占用 0、1 两张卡）：`test "$(npu-smi info | grep -cE '^\| +(0|1) .*OK')" -eq 2`；
 - log_check_command：可选的日志检查命令；命令退出码为 0 表示最近窗口没有匹配错误，非 0 表示发现日志错误或检查失败；不包含 KV connector 专用判断；
@@ -136,7 +172,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 
 ### 3.3 清单变更与安全边界
 
-清单生成后，部署拓扑、容器、端口、设备或原始启动命令发生变化时必须重新生成清单并重启监控。监控进程只读清单，不在运行期间修改清单。命令字段只保存经过部署验收或已部署完成的服务提供的确认的检查命令。命令结果、凭据和完整日志写入部署运行目录或脱敏日志，不写入清单。Pi Extension 只在本机回环端口接收事件，并继续校验已登记的 deployment_key、incident_id 和事件路径；不得把该端口发布到外部网络。
+清单生成后，部署拓扑、容器、端口、设备、Gateway deployment 映射或原始启动命令发生变化时必须重新生成清单并重启监控。监控进程只读清单，不在运行期间修改清单。命令字段只保存经过部署验收或已部署完成的服务提供的确认的检查命令。命令结果、凭据和完整日志写入部署运行目录或脱敏日志，不写入清单；Gateway 返回的 `api_base` 写入事件前会移除用户信息、查询参数和 fragment。Pi Extension 只在本机回环端口接收事件，并继续校验已登记的 deployment_key、incident_id 和事件路径；不得把该端口发布到外部网络。
 
 ## 4. 故障事件处理
 
@@ -163,14 +199,16 @@ recovered / recovered_degraded / failed / waiting_for_user
 
 `signals` 列出已确认信号。Agent 结合 `observation`、可用的 `last_observation` 和 `evidence` 复核。若有 `probe_results`，可查看失败原因和 HTTP 状态码。收到 `probe_execution_error` 时，查看检查项、`kind`、确认次数、退出码和 stderr，先复核检查命令或 SSH、Docker 链路。确认错误出在本次生成的命令时，按第 5.1.2 节修正并复跑。遇到 HTTP `4xx` 时，优先复核地址、认证、请求参数或限流，取得服务故障证据后再决定是否重启。监控事件是事实证据，不是最终故障结论。单次探测不足以支持高风险恢复时，先补充检查。
 
-事件文件由监控进程和 Agent 共同维护，但写入范围不同：
+收到 `gateway_auto_disabled` 时，只能确认 Gateway 中对应 deployment 已满足 `enabled=false && auto_disabled=true` 并退出路由；`auto_disable_cause=unknown` 表示当前 `models` 接口不能区分主动健康检查和真实请求失败计数。Agent 先结合事件中已有的本地探针证据复核，证据不足时再按需读取 Gateway 请求日志，不得把自动摘流本身直接解释为某个容器、NPU 或软件根因。Gateway 已完成摘流时不重复隔离入口；Agent 只恢复并直接验收服务，不调用 Gateway 管理接口强制上线，Gateway 按现有 `auto_recovery_enabled` 和恢复阈值决定重新加入路由。
 
-- 监控进程首次发布事件时写入 `schema_version`、`incident_id`、`deployment_key`、`detected_at`、`service`、`node`、`recovery_group`、`affected_services`、`signals`、`evidence`、`evidence_dropped`、`confirmation_count`、`first_failed_at`、`observation`、`trigger`、`status` 和 `updated_at`，初始状态为 `detected`；
-- Agent 开始处理时将 `status` 改为 `processing`，并补充三个字段：`diagnosis`（故障判断及依据：结论、指向本事件 `evidence` 条目的证据引用、排除的假设）、`recovery`（恢复执行记录：选择的恢复策略与范围、实际执行的动作、SSH/Docker 操作及结果、是否使用备用节点）和 `validation`（验收记录：readiness、通信、模型身份和真实 completion 的逐项验收结果）；
-- Agent 完成验收后将 `status` 改为 `recovered`、`recovered_degraded`、`failed` 或 `waiting_for_user`，仍需用户处理的事项写入 `diagnosis`。`failed` 和 `waiting_for_user` 表示故障尚未解决，同组同类事件继续追加证据。状态为 `recovered` 或 `recovered_degraded` 后，该类故障再次出现时会新建事件；
-- 监控进程不覆盖 Agent 已写入的处理和验收字段。
+Gateway 登录、超时、响应格式、deployment 缺失或映射异常连续三轮时，以 `probe_execution_error` 上报，表示 Gateway 观察链路持续不可用，不表示推理 deployment 已故障。此类事件和同恢复组的服务故障事件分开记录。
 
-Agent 开始恢复前必须先将主故障事件状态更新为 `processing`。在该状态期间，依赖该服务或恢复组的其他服务如果只出现 readiness、日志或业务探针等软信号，监控进程只将证据追加到主事件，不新建事件或再次通知 Agent。主事件恢复完成后，监控重新探测依赖服务；依赖服务仍异常时，再生成新的故障事件。依赖服务自身出现容器退出、SSH 不可达或 NPU 异常等硬信号时，仍可以单独上报。
+事件文件由监控进程创建，并可能在 Agent 处理期间继续追加观测证据。Agent 必须遵守以下写入边界：
+
+- 将事件中由监控进程生成的标识、信号、观测和证据字段视为只读，不得删除或覆盖；
+- Agent开始处理时将 `status` 改为 `processing`，并只补充`diagnosis`（故障判断及依据：结论、指向本事件 `evidence` 条目的证据引用、排除的假设）、`recovery`（恢复执行记录：选择的恢复策略与范围、实际执行的动作、SSH/Docker 操作及结果、是否使用备用节点）和 `validation`（验收记录：readiness、通信、模型身份和真实 completion 的逐项验收结果）；
+- 每次写回前重新读取最新事件，合并并保留监控进程已经追加的字段和证据；
+- 完成验收后将 `status` 改为 `recovered`、`recovered_degraded`、`failed` 或 `waiting_for_user`。仍需用户处理的事项写入 `diagnosis`；`failed` 和 `waiting_for_user` 表示故障尚未解决，同组同类事件继续追加证据；状态为 `recovered` 或 `recovered_degraded` 后，该类故障再次出现时会新建事件。
 
 ## 5. 故障类型和默认策略
 
@@ -194,7 +232,7 @@ Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原�
 
 ### 5.1 原地恢复
 
-在原节点恢复推理服务前，需同时确认以下条件。
+执行恢复前，Agent 必须通过实机检查同时确认以下条件。
 
 - SSH 和 Docker 可用；
 - NPU 设备健康且身份未改变；
@@ -217,7 +255,7 @@ Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原�
 
 ### 5.2 备用节点迁移
 
-以下情况可以迁移：
+执行备用节点迁移前，Agent 必须通过实机检查确认存在以下至少一种情况：
 
 - NPU 健康持续异常；
 - 宿主机或关键网络持续不可达；
@@ -252,9 +290,9 @@ Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原�
 - 每次执行前清理上次失败残留，执行后通过完整验收：readiness、通信、入口真实 completion 和模型身份；
 - 降级命令最多尝试 2 次，超限后停止尝试，事件状态置为 waiting_for_user 并上报用户。
 
-成功后的义务：
+成功降级后，Agent 必须完成：
 
-- 事件终态为 recovered_degraded，禁止使用 recovered；
+- 将事件终态改为 recovered_degraded，禁止使用 recovered；
 - 降级命令逐字追加到 commands.log，作为该降级形态后续恢复的重放命令；
 - 按本文件第 3 章的清单变更与安全边界重新生成 monitor-manifest.json，并重启 systemd 监控单元；
 - 部署报告记录原拓扑、降级拓扑和容量预期，并通知用户：硬件修复后按原始部署命令恢复原拓扑，重新走部署验收并重新生成清单。

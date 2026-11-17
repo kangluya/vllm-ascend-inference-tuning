@@ -8,6 +8,7 @@ facts and emits incident files; recovery decisions remain in the Pi Skill.
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -35,6 +37,14 @@ MAX_INCIDENT_EVIDENCE = 100
 SOFT_SIGNAL_CONFIRMATIONS = 3
 UNKNOWN_PROBE_CONFIRMATIONS = 3
 PROBE_EXECUTION_ERROR = "probe_execution_error"
+GATEWAY_AUTO_DISABLED = "gateway_auto_disabled"
+GATEWAY_ERROR_CONFIRMATIONS = 3
+GATEWAY_MODELS_EVENT = "gateway_models"
+GATEWAY_ERROR_EVENT = "gateway_error"
+GATEWAY_API_KEY_ENV = "VLLM_GATEWAY_ADMIN_API_KEY"
+GATEWAY_API_KEY_FILE_ENV = "VLLM_GATEWAY_ADMIN_API_KEY_FILE"
+GATEWAY_USER_ID_ENV = "VLLM_GATEWAY_ADMIN_USER_ID"
+GATEWAY_CREDENTIAL_NAME = "boom_gateway_admin_api_key"
 PROBE_EXECUTION_ERROR_KINDS = {
     "command_execution_failed",
     "curl_execution_failed",
@@ -188,10 +198,12 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
     services = manifest.get("services")
     if not isinstance(services, list):
         raise ValueError("manifest services must be a list")
+    services_by_id: dict[str, list[Mapping[str, Any]]] = {}
     for service in services:
         if not isinstance(service, Mapping):
             raise ValueError("each service in manifest must be an object")
         service_id = str(service.get("service_id") or service.get("container") or "unknown")
+        services_by_id.setdefault(service_id, []).append(service)
         container = str(service.get("container") or "")
         command = _command(service.get("process_check_command"))
         if not container or command is None:
@@ -206,6 +218,220 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
             raise ValueError(
                 f"service {service_id} process_check_command must target {container}"
             )
+
+    gateway = manifest.get("gateway")
+    if gateway is None:
+        return
+    if not isinstance(gateway, Mapping):
+        raise ValueError("manifest gateway must be an object")
+    enabled = gateway.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("gateway.enabled must be a boolean")
+    forbidden = {"api_key", "master_key", "password", "token"}.intersection(gateway)
+    if forbidden:
+        raise ValueError("gateway credentials must not be stored in monitor-manifest.json")
+    if not enabled:
+        return
+    base_url = str(gateway.get("base_url") or "")
+    parsed = urllib.parse.urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("gateway.base_url must be an absolute http(s) URL")
+    try:
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("gateway.base_url contains an invalid port") from exc
+    if (
+        parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError("gateway.base_url must be a credential-free Gateway origin URL")
+    if parsed_port is not None and not 1 <= parsed_port <= 65535:
+        raise ValueError("gateway.base_url contains an invalid port")
+    for field, default in (
+        ("poll_interval_seconds", 5),
+        ("request_timeout_seconds", 5),
+    ):
+        try:
+            value = float(gateway.get(field, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"gateway.{field} must be a positive number") from exc
+        if value <= 0:
+            raise ValueError(f"gateway.{field} must be a positive number")
+    mappings = gateway.get("deployments")
+    if not isinstance(mappings, list) or not mappings:
+        raise ValueError("gateway.deployments must be a non-empty list")
+    seen_deployments: set[str] = set()
+    for item in mappings:
+        if not isinstance(item, Mapping):
+            raise ValueError("each gateway deployment mapping must be an object")
+        if {"api_key", "master_key", "password", "token"}.intersection(item):
+            raise ValueError("gateway credentials must not be stored in monitor-manifest.json")
+        deployment_id = str(item.get("gateway_deployment_id") or "")
+        service_id = str(item.get("service_id") or "")
+        if not deployment_id or not service_id:
+            raise ValueError(
+                "gateway deployment mapping requires gateway_deployment_id and service_id"
+            )
+        if deployment_id in seen_deployments:
+            raise ValueError(f"duplicate gateway_deployment_id: {deployment_id}")
+        seen_deployments.add(deployment_id)
+        matching_services = services_by_id.get(service_id, [])
+        if len(matching_services) != 1:
+            raise ValueError(
+                f"gateway deployment {deployment_id} requires exactly one service_id {service_id}"
+            )
+        service = matching_services[0]
+        configured_group = item.get("recovery_group")
+        if configured_group and str(configured_group) != _recovery_group(service):
+            raise ValueError(
+                f"gateway deployment {deployment_id} recovery_group does not match service {service_id}"
+            )
+
+
+def _safe_url(value: Any) -> str:
+    """Return a URL without user-info, query parameters, or fragments."""
+    raw = str(value or "")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return raw.split("?", 1)[0].split("#", 1)[0]
+    if not parsed.scheme or not parsed.netloc:
+        return raw.split("?", 1)[0].split("#", 1)[0]
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None:
+        host = f"{host}:{port}"
+    return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+
+
+def _gateway_api_key() -> str | None:
+    direct = os.environ.get(GATEWAY_API_KEY_ENV)
+    if direct:
+        return direct
+    path_value = os.environ.get(GATEWAY_API_KEY_FILE_ENV)
+    if not path_value:
+        credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+        if credential_dir:
+            path_value = str(Path(credential_dir) / GATEWAY_CREDENTIAL_NAME)
+    if not path_value:
+        return None
+    try:
+        value = Path(path_value).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise GatewayClientError(
+            "gateway_config_error", "Gateway administrator credential file is unavailable"
+        ) from exc
+    return value or None
+
+
+class GatewayClientError(RuntimeError):
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+class GatewayClient:
+    """Minimal Boom Gateway admin client with an in-memory session cookie."""
+
+    def __init__(self, base_url: str, timeout_seconds: float = 5) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookie_jar)
+        )
+        self.authenticated = False
+
+    def _request_json(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        body: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with self.opener.open(request, timeout=self.timeout_seconds) as response:
+                raw = response.read(4 * 1024 * 1024 + 1)
+                if len(raw) > 4 * 1024 * 1024:
+                    raise GatewayClientError(
+                        "gateway_response_invalid", "Gateway response exceeds 4 MiB"
+                    )
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                kind = "gateway_auth_failed"
+            elif exc.code == 403:
+                kind = "gateway_forbidden"
+            elif exc.code == 429:
+                kind = "gateway_rate_limited"
+            else:
+                kind = "gateway_http_error"
+            raise GatewayClientError(kind, f"Gateway returned HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            kind = "gateway_timeout" if isinstance(reason, TimeoutError) else "gateway_unreachable"
+            raise GatewayClientError(kind, "Gateway management endpoint is unavailable") from exc
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GatewayClientError(
+                "gateway_response_invalid", "Gateway returned invalid JSON"
+            ) from exc
+        if not isinstance(value, Mapping):
+            raise GatewayClientError(
+                "gateway_response_invalid", "Gateway response must be a JSON object"
+            )
+        return value
+
+    def login(self) -> None:
+        api_key = _gateway_api_key()
+        if not api_key:
+            raise GatewayClientError(
+                "gateway_config_error",
+                f"Gateway administrator credential is not configured in {GATEWAY_API_KEY_ENV}",
+            )
+        user_id = os.environ.get(GATEWAY_USER_ID_ENV, "admin")
+        self._request_json(
+            "/dashboard/api/auth/login",
+            method="POST",
+            body={"user_id": user_id, "api_key": api_key},
+        )
+        self.authenticated = True
+
+    def list_models(self) -> list[Mapping[str, Any]]:
+        if not self.authenticated:
+            self.login()
+        try:
+            payload = self._request_json("/dashboard/api/admin/models")
+        except GatewayClientError as exc:
+            if exc.kind != "gateway_auth_failed":
+                raise
+            self.authenticated = False
+            self.login()
+            payload = self._request_json("/dashboard/api/admin/models")
+        models = payload.get("models")
+        if not isinstance(models, list) or any(not isinstance(item, Mapping) for item in models):
+            raise GatewayClientError(
+                "gateway_response_invalid", "Gateway models response has no valid models list"
+            )
+        return list(models)
 
 
 def _probe_details(
@@ -422,6 +648,114 @@ def _find_open_incident(
     return newest
 
 
+def _find_gateway_episode(events_dir: Path, episode_id: str) -> Path | None:
+    if not events_dir.exists():
+        return None
+    for path in events_dir.glob("incident-*.json"):
+        item = read_json(path, {})
+        if not isinstance(item, dict):
+            continue
+        episodes = item.get("gateway_episodes", [])
+        if isinstance(episodes, list) and episode_id in episodes:
+            return path
+    return None
+
+
+def _append_gateway_evidence(
+    path: Path,
+    service: Mapping[str, Any],
+    observation: Mapping[str, Any],
+    evidence: Sequence[str],
+    episode_id: str,
+) -> bool:
+    """Attach one Gateway auto-disable episode without re-notifying Pi."""
+    incident = read_json(path, {})
+    if not isinstance(incident, dict):
+        return False
+    episodes = incident.setdefault("gateway_episodes", [])
+    if not isinstance(episodes, list):
+        episodes = []
+        incident["gateway_episodes"] = episodes
+    if episode_id in episodes:
+        return False
+    episodes.append(episode_id)
+
+    service_id = str(service.get("service_id") or service.get("container") or "unknown")
+    affected = incident.setdefault("affected_services", [])
+    if isinstance(affected, list) and service_id not in affected:
+        affected.append(service_id)
+    signals = incident.setdefault("signals", [])
+    if isinstance(signals, list) and GATEWAY_AUTO_DISABLED not in signals:
+        signals.append(GATEWAY_AUTO_DISABLED)
+        incident["signals"] = sorted(set(str(value) for value in signals))
+
+    now = utc_now()
+    entries = incident.setdefault("evidence", [])
+    if isinstance(entries, list):
+        entries.append(
+            {
+                "kind": "gateway_models",
+                "service": service_id,
+                "gateway_deployment_id": observation.get("gateway_deployment_id"),
+                "gateway_episode": episode_id,
+                "items": [truncate(item) for item in evidence],
+                "first_seen_at": now,
+                "last_seen_at": now,
+                "repeat_count": 1,
+            }
+        )
+        if len(entries) > MAX_INCIDENT_EVIDENCE:
+            dropped = len(entries) - MAX_INCIDENT_EVIDENCE
+            incident["evidence_dropped"] = int(incident.get("evidence_dropped", 0) or 0) + dropped
+            del entries[:-MAX_INCIDENT_EVIDENCE]
+    incident["last_gateway_observation"] = dict(observation)
+    incident["updated_at"] = now
+    atomic_write_json(path, incident)
+    return True
+
+
+def _record_gateway_rejoined(
+    path: Path,
+    service: Mapping[str, Any],
+    observation: Mapping[str, Any],
+    episode_id: str,
+) -> None:
+    incident = read_json(path, {})
+    if not isinstance(incident, dict):
+        return
+    rejoined = incident.setdefault("gateway_rejoined_episodes", {})
+    if not isinstance(rejoined, dict):
+        rejoined = {}
+        incident["gateway_rejoined_episodes"] = rejoined
+    if episode_id in rejoined:
+        return
+    now = utc_now()
+    service_id = str(service.get("service_id") or service.get("container") or "unknown")
+    entries = incident.setdefault("evidence", [])
+    if isinstance(entries, list):
+        entries.append(
+            {
+                "kind": "gateway_route_state",
+                "service": service_id,
+                "gateway_deployment_id": observation.get("gateway_deployment_id"),
+                "gateway_episode": episode_id,
+                "items": ["Gateway deployment returned to routing"],
+                "first_seen_at": now,
+                "last_seen_at": now,
+                "repeat_count": 1,
+            }
+        )
+        if len(entries) > MAX_INCIDENT_EVIDENCE:
+            dropped = len(entries) - MAX_INCIDENT_EVIDENCE
+            incident["evidence_dropped"] = int(incident.get("evidence_dropped", 0) or 0) + dropped
+            del entries[:-MAX_INCIDENT_EVIDENCE]
+    incident["last_gateway_observation"] = dict(observation)
+    rejoined[episode_id] = now
+    incident["gateway_rejoined_at"] = now
+    incident["updated_at"] = now
+    atomic_write_json(path, incident)
+
+
 def append_incident_evidence(
     path: Path,
     service: Mapping[str, Any],
@@ -548,6 +882,40 @@ def build_incident(
     }
 
 
+def build_gateway_incident(
+    manifest: Mapping[str, Any],
+    service: Mapping[str, Any],
+    observation: Mapping[str, Any],
+    evidence: Sequence[str],
+    episode_id: str,
+) -> dict[str, Any]:
+    trigger = {
+        "source": "boom_gateway",
+        "kind": "deployment_auto_disabled",
+        "gateway_deployment_id": observation.get("gateway_deployment_id"),
+        "gateway_episode": episode_id,
+    }
+    incident = build_incident(
+        manifest,
+        service,
+        observation,
+        evidence,
+        signals=[GATEWAY_AUTO_DISABLED],
+        event=trigger,
+    )
+    incident["gateway_episodes"] = [episode_id]
+    incident["last_gateway_observation"] = dict(observation)
+    if incident["evidence"]:
+        incident["evidence"][0].update(
+            {
+                "kind": "gateway_models",
+                "gateway_deployment_id": observation.get("gateway_deployment_id"),
+                "gateway_episode": episode_id,
+            }
+        )
+    return incident
+
+
 class DockerEventWatcher(threading.Thread):
     def __init__(
         self,
@@ -617,6 +985,59 @@ class DockerEventWatcher(threading.Thread):
             backoff = min(backoff * 2, 30.0)
 
 
+class GatewayWatcher(threading.Thread):
+    def __init__(
+        self,
+        client: GatewayClient,
+        interval_seconds: float,
+        events: queue.Queue[dict[str, Any]],
+        stop_event: threading.Event,
+    ) -> None:
+        super().__init__(name="gateway-models-watcher", daemon=True)
+        self.client = client
+        self.interval_seconds = interval_seconds
+        self.events = events
+        self.stop_event = stop_event
+
+    def run(self) -> None:
+        delay = self.interval_seconds
+        while not self.stop_event.is_set():
+            try:
+                models = self.client.list_models()
+            except GatewayClientError as exc:
+                self.events.put(
+                    {
+                        "monitor_event_type": GATEWAY_ERROR_EVENT,
+                        "kind": exc.kind,
+                        "message": truncate(str(exc)),
+                        "observed_at": utc_now(),
+                    }
+                )
+                delay = min(max(self.interval_seconds, delay * 2), 60.0)
+            except Exception as exc:  # Keep the observer alive on unexpected client bugs.
+                LOGGER.exception("unexpected Gateway watcher error")
+                self.events.put(
+                    {
+                        "monitor_event_type": GATEWAY_ERROR_EVENT,
+                        "kind": "gateway_client_error",
+                        "message": truncate(str(exc)),
+                        "observed_at": utc_now(),
+                    }
+                )
+                delay = min(max(self.interval_seconds, delay * 2), 60.0)
+            else:
+                self.events.put(
+                    {
+                        "monitor_event_type": GATEWAY_MODELS_EVENT,
+                        "models": models,
+                        "observed_at": utc_now(),
+                    }
+                )
+                delay = self.interval_seconds
+            if self.stop_event.wait(delay):
+                break
+
+
 class Monitor:
     def __init__(
         self,
@@ -636,10 +1057,12 @@ class Monitor:
         self.stop_event = threading.Event()
         self.probe_events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.report_queue: queue.Queue[Path] = queue.Queue()
-        self.watchers: list[DockerEventWatcher] = []
+        self.watchers: list[threading.Thread] = []
         self.soft_failure_counts: dict[tuple[str, str], int] = {}
         self.soft_failure_first_seen: dict[tuple[str, str], str] = {}
         self.unknown_probe_streaks: dict[str, dict[str, tuple[int, str]]] = {}
+        self.gateway_error_streaks: dict[str, tuple[int, str]] = {}
+        self.gateway_active_episodes: dict[str, str] = {}
         self.reporter = threading.Thread(
             target=self._report_loop,
             name="pi-http-reporter",
@@ -650,6 +1073,21 @@ class Monitor:
     def services(self) -> list[Mapping[str, Any]]:
         values = self.manifest.get("services", [])
         return [item for item in values if isinstance(item, dict)]
+
+    @property
+    def gateway_config(self) -> Mapping[str, Any] | None:
+        value = self.manifest.get("gateway")
+        if not isinstance(value, Mapping) or not value.get("enabled", True):
+            return None
+        return value
+
+    @property
+    def gateway_mappings(self) -> list[Mapping[str, Any]]:
+        gateway = self.gateway_config
+        if gateway is None:
+            return []
+        values = gateway.get("deployments", [])
+        return [item for item in values if isinstance(item, Mapping)]
 
     def write_state(self, status: str, **extra: Any) -> None:
         state = read_json(self.state_path, {})
@@ -687,6 +1125,19 @@ class Monitor:
             )
             self.watchers.append(watcher)
             watcher.start()
+        gateway = self.gateway_config
+        if gateway is not None:
+            watcher = GatewayWatcher(
+                GatewayClient(
+                    str(gateway.get("base_url")),
+                    float(gateway.get("request_timeout_seconds", 5)),
+                ),
+                float(gateway.get("poll_interval_seconds", 5)),
+                self.probe_events,
+                self.stop_event,
+            )
+            self.watchers.append(watcher)
+            watcher.start()
 
     def stop_watchers(self) -> None:
         self.stop_event.set()
@@ -696,6 +1147,13 @@ class Monitor:
     def find_service(self, host: str, container: str) -> Mapping[str, Any] | None:
         for service in self.services:
             if _host(service) == host and str(service.get("container")) == container:
+                return service
+        return None
+
+    def find_service_by_id(self, service_id: str) -> Mapping[str, Any] | None:
+        for service in self.services:
+            current = str(service.get("service_id") or service.get("container") or "")
+            if current == service_id:
                 return service
         return None
 
@@ -749,6 +1207,202 @@ class Monitor:
                 incident_id = str(item.get("incident_id") or path.stem)
                 return path, incident_id
         return None
+
+    def _advance_gateway_error(self, key: str) -> tuple[int, str]:
+        count, first_seen = self.gateway_error_streaks.get(key, (0, utc_now()))
+        streak = (count + 1, first_seen)
+        self.gateway_error_streaks[key] = streak
+        return streak
+
+    def _clear_gateway_error(self, key: str) -> None:
+        self.gateway_error_streaks.pop(key, None)
+
+    def _record_gateway_observer_error(
+        self,
+        services: Sequence[Mapping[str, Any]],
+        *,
+        kind: str,
+        message: str,
+        count: int,
+        first_seen: str,
+    ) -> None:
+        if count < GATEWAY_ERROR_CONFIRMATIONS:
+            return
+        recorded_groups: set[str] = set()
+        for service in services:
+            recovery_group = _recovery_group(service)
+            if recovery_group in recorded_groups:
+                continue
+            recorded_groups.add(recovery_group)
+            observation = {
+                "service_id": service.get("service_id") or service.get("container"),
+                "gateway_observer_ok": None,
+                "probe_results": {
+                    "gateway_models": {
+                        "outcome": "unknown",
+                        "kind": kind,
+                        "returncode": None,
+                        "elapsed_ms": 0,
+                    }
+                },
+            }
+            self._record_incident(
+                service,
+                observation,
+                [f"gateway_models: {kind} {truncate(message)}".rstrip()],
+                {"source": "boom_gateway", "kind": kind},
+                [PROBE_EXECUTION_ERROR],
+                count,
+                first_seen,
+            )
+
+    def handle_gateway_error(self, event: Mapping[str, Any]) -> None:
+        kind = str(event.get("kind") or "gateway_client_error")
+        message = str(event.get("message") or "Gateway models request failed")
+        count, first_seen = self._advance_gateway_error("gateway_models_api")
+        services = [
+            service
+            for mapping in self.gateway_mappings
+            if (
+                service := self.find_service_by_id(str(mapping.get("service_id") or ""))
+            )
+            is not None
+        ]
+        self._record_gateway_observer_error(
+            services,
+            kind=kind,
+            message=message,
+            count=count,
+            first_seen=first_seen,
+        )
+
+    def _handle_gateway_mapping_error(
+        self,
+        mapping: Mapping[str, Any],
+        kind: str,
+        message: str,
+    ) -> None:
+        deployment_id = str(mapping.get("gateway_deployment_id") or "unknown")
+        key = f"gateway_mapping:{deployment_id}"
+        count, first_seen = self._advance_gateway_error(key)
+        service = self.find_service_by_id(str(mapping.get("service_id") or ""))
+        if service is not None:
+            self._record_gateway_observer_error(
+                [service],
+                kind=kind,
+                message=message,
+                count=count,
+                first_seen=first_seen,
+            )
+
+    def handle_gateway_models(self, event: Mapping[str, Any]) -> None:
+        values = event.get("models")
+        if not isinstance(values, list):
+            self.handle_gateway_error(
+                {
+                    "kind": "gateway_response_invalid",
+                    "message": "Gateway models event has no models list",
+                }
+            )
+            return
+        self._clear_gateway_error("gateway_models_api")
+        by_deployment: dict[str, list[Mapping[str, Any]]] = {}
+        for item in values:
+            if not isinstance(item, Mapping):
+                continue
+            deployment_id = item.get("deployment_id")
+            if deployment_id:
+                by_deployment.setdefault(str(deployment_id), []).append(item)
+
+        for mapping in self.gateway_mappings:
+            deployment_id = str(mapping.get("gateway_deployment_id") or "")
+            service = self.find_service_by_id(str(mapping.get("service_id") or ""))
+            if service is None:
+                continue  # Manifest validation prevents this at startup.
+            rows = by_deployment.get(deployment_id, [])
+            if len(rows) != 1:
+                self._handle_gateway_mapping_error(
+                    mapping,
+                    "gateway_deployment_missing" if not rows else "gateway_deployment_duplicate",
+                    f"Expected one Gateway deployment row for {deployment_id}, found {len(rows)}",
+                )
+                continue
+            row = rows[0]
+            enabled = row.get("enabled")
+            auto_disabled = row.get("auto_disabled")
+            updated_at = row.get("updated_at")
+            if (
+                not isinstance(enabled, bool)
+                or not isinstance(auto_disabled, bool)
+                or not isinstance(updated_at, str)
+                or not updated_at
+            ):
+                self._handle_gateway_mapping_error(
+                    mapping,
+                    "gateway_response_invalid",
+                    f"Gateway deployment {deployment_id} has invalid state fields",
+                )
+                continue
+            self._clear_gateway_error(f"gateway_mapping:{deployment_id}")
+            observation = {
+                "gateway_deployment_id": deployment_id,
+                "model_name": row.get("model_name"),
+                "api_base": _safe_url(row.get("api_base")),
+                "enabled": enabled,
+                "auto_disabled": auto_disabled,
+                "updated_at": updated_at,
+                "auto_disable_cause": "unknown",
+                "trigger_source": "gateway",
+            }
+
+            if not enabled and auto_disabled:
+                episode_id = f"gateway:{deployment_id}:{updated_at}"
+                if self.gateway_active_episodes.get(deployment_id) == episode_id:
+                    continue
+                self.gateway_active_episodes[deployment_id] = episode_id
+                if _find_gateway_episode(self.events_dir, episode_id) is not None:
+                    continue
+                evidence = [
+                    f"Gateway deployment {deployment_id} is auto-disabled and removed from routing",
+                    f"model={row.get('model_name')} api_base={observation['api_base']} updated_at={updated_at}",
+                    "auto_disable_cause=unknown",
+                ]
+                existing = _find_open_incident(
+                    self.events_dir,
+                    _recovery_group(service),
+                    probe_only=False,
+                )
+                if existing is not None:
+                    _append_gateway_evidence(
+                        existing,
+                        service,
+                        observation,
+                        evidence,
+                        episode_id,
+                    )
+                    continue
+                incident = build_gateway_incident(
+                    self.manifest,
+                    service,
+                    observation,
+                    evidence,
+                    episode_id,
+                )
+                path = _incident_path(self.events_dir, incident["incident_id"])
+                atomic_write_json(path, incident)
+                self.report_queue.put(path)
+                LOGGER.warning(
+                    "Gateway auto-disabled deployment %s for service %s",
+                    deployment_id,
+                    service.get("service_id") or service.get("container"),
+                )
+                continue
+
+            active_episode = self.gateway_active_episodes.pop(deployment_id, None)
+            if enabled and not auto_disabled and active_episode:
+                path = _find_gateway_episode(self.events_dir, active_episode)
+                if path is not None:
+                    _record_gateway_rejoined(path, service, observation, active_episode)
 
     def confirm_signals(
         self,
@@ -903,6 +1557,13 @@ class Monitor:
                 self.probe(service, None)
 
     def handle_runtime_event(self, event: Mapping[str, Any]) -> None:
+        event_type = event.get("monitor_event_type")
+        if event_type == GATEWAY_MODELS_EVENT:
+            self.handle_gateway_models(event)
+            return
+        if event_type == GATEWAY_ERROR_EVENT:
+            self.handle_gateway_error(event)
+            return
         service = self.find_service(
             str(event.get("host") or ""),
             str(event.get("container") or event.get("Actor", {}).get("Attributes", {}).get("name", "")),
@@ -927,16 +1588,27 @@ class Monitor:
             if not isinstance(payload, dict):
                 self.report_queue.task_done()
                 continue
+            summary = {
+                "service": payload.get("service"),
+                "node": payload.get("node"),
+                "signals": payload.get("signals", []),
+            }
+            gateway_observation = payload.get("last_gateway_observation")
+            if isinstance(gateway_observation, Mapping):
+                summary.update(
+                    {
+                        "source": "boom_gateway",
+                        "gateway_deployment_id": gateway_observation.get(
+                            "gateway_deployment_id"
+                        ),
+                    }
+                )
             body = {
                 "schema_version": 1,
                 "deployment_key": self.manifest.get("deployment_key"),
                 "incident_id": payload.get("incident_id"),
                 "event_path": str(path.relative_to(self.root)).replace(os.sep, "/"),
-                "summary": {
-                    "service": payload.get("service"),
-                    "node": payload.get("node"),
-                    "signals": payload.get("signals", []),
-                },
+                "summary": summary,
             }
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             headers = {"Content-Type": "application/json"}
