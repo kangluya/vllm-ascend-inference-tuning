@@ -417,6 +417,47 @@ class FaultMonitorTests(unittest.TestCase):
                 }
             )
 
+    def test_multiple_monitors_use_isolated_deployment_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            monitors = []
+            for deployment_key, container in (
+                ("dsv4-prod", "dsv4-0"),
+                ("qwen-prod", "qwen-0"),
+            ):
+                deployment_dir = base / deployment_key
+                deployment_dir.mkdir()
+                manifest_path = deployment_dir / "monitor-manifest.json"
+                atomic_write_json(
+                    manifest_path,
+                    {
+                        "deployment_key": deployment_key,
+                        "deployment_dir": str(deployment_dir),
+                        "services": [
+                            {
+                                "service_id": container,
+                                "host": "node-a",
+                                "container": container,
+                                "process_check_command": [
+                                    "docker",
+                                    "exec",
+                                    container,
+                                    "pgrep",
+                                    "-af",
+                                    "[v]llm",
+                                ],
+                            }
+                        ],
+                    },
+                )
+                monitors.append(Monitor(manifest_path))
+
+            self.assertNotEqual(monitors[0].root, monitors[1].root)
+            self.assertNotEqual(monitors[0].state_path, monitors[1].state_path)
+            self.assertNotEqual(monitors[0].events_dir, monitors[1].events_dir)
+            self.assertEqual(monitors[0].state_path.parent.name, "dsv4-prod")
+            self.assertEqual(monitors[1].state_path.parent.name, "qwen-prod")
+
     def test_open_group_incident_collects_new_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "incident.json"
