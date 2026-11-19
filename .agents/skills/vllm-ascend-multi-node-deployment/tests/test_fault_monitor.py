@@ -8,10 +8,11 @@ from unittest.mock import Mock, patch
 
 from scripts.vllm_fault_monitor import (
     CommandResult,
-    GATEWAY_API_KEY_ENV,
     GATEWAY_AUTO_DISABLED,
+    GATEWAY_CREDENTIAL_NAME,
     GATEWAY_USER_ID_ENV,
     GatewayClient,
+    GatewayClientError,
     Monitor,
     RemoteExecutor,
     atomic_write_json,
@@ -416,6 +417,47 @@ class FaultMonitorTests(unittest.TestCase):
                     ]
                 }
             )
+
+    def test_multiple_monitors_use_isolated_deployment_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            monitors = []
+            for deployment_key, container in (
+                ("dsv4-prod", "dsv4-0"),
+                ("qwen-prod", "qwen-0"),
+            ):
+                deployment_dir = base / deployment_key
+                deployment_dir.mkdir()
+                manifest_path = deployment_dir / "monitor-manifest.json"
+                atomic_write_json(
+                    manifest_path,
+                    {
+                        "deployment_key": deployment_key,
+                        "deployment_dir": str(deployment_dir),
+                        "services": [
+                            {
+                                "service_id": container,
+                                "host": "node-a",
+                                "container": container,
+                                "process_check_command": [
+                                    "docker",
+                                    "exec",
+                                    container,
+                                    "pgrep",
+                                    "-af",
+                                    "[v]llm",
+                                ],
+                            }
+                        ],
+                    },
+                )
+                monitors.append(Monitor(manifest_path))
+
+            self.assertNotEqual(monitors[0].root, monitors[1].root)
+            self.assertNotEqual(monitors[0].state_path, monitors[1].state_path)
+            self.assertNotEqual(monitors[0].events_dir, monitors[1].events_dir)
+            self.assertEqual(monitors[0].state_path.parent.name, "dsv4-prod")
+            self.assertEqual(monitors[1].state_path.parent.name, "qwen-prod")
 
     def test_open_group_incident_collects_new_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -855,15 +897,19 @@ class GatewayIntegrationTests(unittest.TestCase):
             JsonResponse({"ok": True}),
             JsonResponse({"models": [{"deployment_id": "deployment-d1"}]}),
         ]
-        with patch.dict(
-            os.environ,
-            {
-                GATEWAY_API_KEY_ENV: "secret",
-                GATEWAY_USER_ID_ENV: "admin",
-            },
-            clear=False,
-        ):
-            models = client.list_models()
+        with tempfile.TemporaryDirectory() as credential_dir:
+            Path(credential_dir, GATEWAY_CREDENTIAL_NAME).write_text(
+                "secret", encoding="utf-8"
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "CREDENTIALS_DIRECTORY": credential_dir,
+                    GATEWAY_USER_ID_ENV: "admin",
+                },
+                clear=False,
+            ):
+                models = client.list_models()
 
         self.assertEqual(models[0]["deployment_id"], "deployment-d1")
         requests = [call.args[0] for call in client.opener.open.call_args_list]
@@ -907,9 +953,29 @@ class GatewayIntegrationTests(unittest.TestCase):
             JsonResponse({"ok": True}),
             JsonResponse({"models": []}),
         ]
-        with patch.dict(os.environ, {GATEWAY_API_KEY_ENV: "secret"}, clear=False):
-            self.assertEqual(client.list_models(), [])
+        with tempfile.TemporaryDirectory() as credential_dir:
+            Path(credential_dir, GATEWAY_CREDENTIAL_NAME).write_text(
+                "secret", encoding="utf-8"
+            )
+            with patch.dict(
+                os.environ, {"CREDENTIALS_DIRECTORY": credential_dir}, clear=False
+            ):
+                self.assertEqual(client.list_models(), [])
         self.assertEqual(client.opener.open.call_count, 4)
+
+    def test_gateway_client_requires_systemd_credential(self) -> None:
+        client = GatewayClient("http://gateway:3000")
+        with patch.dict(
+            os.environ,
+            {
+                "CREDENTIALS_DIRECTORY": "",
+                "VLLM_GATEWAY_ADMIN_API_KEY": "secret",
+                "VLLM_GATEWAY_ADMIN_API_KEY_FILE": "/tmp/not-used",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(GatewayClientError, "systemd credential"):
+                client.list_models()
 
 
 if __name__ == "__main__":

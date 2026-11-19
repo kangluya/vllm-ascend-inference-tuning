@@ -23,37 +23,46 @@
 
 执行本节前必须满足以下任一条件：本次新部署已经通过部署验收，或者已有部署已经完成第 1.2 节的核对、记录和接入验收。满足条件后按以下顺序初始化监控：
 
+存在多个能够独立停止、重建和验收的模型服务部署时，对每个模型服务部署分别执行以下步骤。每个模型服务部署使用独立的 `deployment_key`、部署目录、monitor-manifest.json 和 systemd 单元；同一模型服务部署内部必须共同恢复的 Master/Worker 或 Prefill/Decode/Proxy/Mooncake 作为服务组件继续放在同一份清单的 `services` 数组中。多个模型服务部署可以运行在同一台控制宿主机并共享监控脚本、Pi 通知地址和 Gateway 管理凭据，但 monitor-state.json、events、deployment_report.json 和 commands.log 必须按 deployment_key 隔离。
+
 1. 生成 monitor-manifest.json，包含 deployment_key、control_host、监控进程可送达的 agent_notify endpoint（字段规则见第 3.2 节）、探测周期，以及每个服务的节点、容器、recovery_group、基于实机进程身份生成的必填容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；需要接入 Gateway 时，额外配置第 3.2 节的可选 `gateway` 映射，不删除或关闭原有服务探针；端口、设备、挂载、环境变量和完整部署命令继续记录在 deployment_report.json 与 commands.log；monitor-manifest.json 的字段契约见本文件第 3 章；
 2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；从控制宿主机侧请求 agent_notify 端点的健康检查接口（同机时即本地请求；不同机时通过 SSH 在控制宿主机上请求）确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功；确认失败时停止流程，不得启动监控单元；
-3. 配置 Gateway 增强时，从控制宿主机验证 Gateway 管理地址可达、管理员认证有效，并通过 `/dashboard/api/admin/models` 确认每个 `gateway_deployment_id` 唯一存在且映射到正确的入口服务；认证信息只放入 systemd credential 或权限受限的环境文件，不写入清单；验证失败时保留原有探针配置并停止 Gateway 增强的接入，不得带着错误映射启动；
-4. 将 Skill 中的 `scripts/vllm_fault_monitor.py` 通过 SSH 复制到控制宿主机的 `/data/boom/deployment/vllm_fault_monitor.py`，并设置为可执行；只有路由确认成功且脚本复制完成后，才能注册并启动本次部署的 systemd 监控单元；
+3. 配置接入 boom Gateway 时，从控制宿主机验证 Gateway 管理地址可达、管理员认证有效，并通过 `/dashboard/api/admin/models` 确认每个 `gateway_deployment_id` 唯一存在且映射到正确的入口服务；认证信息必须通过第 2.2 节规定的 systemd credential 提供，不写入清单；验证失败时保留原有探针配置并停止 Gateway 的接入，不得带着错误映射启动；
+4. 将 Skill 中的 `scripts/vllm_fault_monitor.py` 通过 SSH 复制到控制宿主机的共享路径 `/data/boom/deployment/vllm_fault_monitor.py`，并设置为可执行；只有路由确认成功且脚本复制完成后，才能注册并启动本次部署的 systemd 监控单元；
 5. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
 6. 监控进程通过 HTTP 向 Pi Extension 的 /v1/fault-events 上报事件。
 
 ## 2. systemd 监控单元
 
-为每个 deployment_key 注册一个独立的 systemd 单元，单元名固定为 `vllm-fault-monitor-<deployment_key>.service`，只用于管理本次部署的运行周期，不配置开机自启软链。
+为每个 deployment_key 注册一个独立的 systemd 单元，单元名固定为 `vllm-fault-monitor-<deployment_key>.service`，只用于管理本次部署的运行周期，不配置开机自启软链。监控脚本可以共享；monitor-manifest.json、monitor-state.json、events、deployment_report.json 和 commands.log 必须位于该 deployment_key 的独立部署目录中。
+
+### 2.1 基础监控单元
+
+创建 `/etc/systemd/system/vllm-fault-monitor-<deployment_key>.service`，写入以下基础配置：
 
 ~~~ini
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /data/boom/deployment/vllm_fault_monitor.py --manifest /data/boom/deployment/monitor-manifest.json
+ExecStart=/usr/bin/python3 /data/boom/deployment/vllm_fault_monitor.py --manifest /data/boom/deployment/<deployment_key>/monitor-manifest.json
 Restart=on-failure
 RestartSec=5
 KillMode=control-group
 ~~~
 
-Agent 必须先完成 deployment_key 路由登记再启动 systemd 单元。监控进程启动后自行写入 monitor-state.json，其中包括 deployment_key、清单绝对路径、PID/PGID、启动时间和命令身份。Agent 只读取这些字段。用户主动停止时先停止该单元，防止 systemd 自动重新拉起监控进程，再使用 monitor-state.json 校验并精确处理当前进程。
+示例中的 `<deployment_key>` 必须替换为当前模型服务部署的实际值。Agent 必须先完成 deployment_key 路由登记再启动 systemd 单元。用户主动停止监控时先停止该单元，防止 systemd 自动重新拉起监控进程，再使用 monitor-state.json 校验并精确处理当前进程。
 
-配置 Gateway 增强时，推荐给上述单元增加受保护的 systemd credential：
+### 2.2 Gateway 接入时追加的单元配置
+
+Agent 需要接入 Boom Gateway 时，完成以下操作：
+
+Agent 从部署流程提供的受保护密钥参数中读取 Gateway 管理员 API key；读取成功后，Agent 创建凭据文件并配置 LoadCredential。如果没有该受保护密钥参数，停止 Gateway 接入配置。创建 `/etc/boom/credentials/gateway-admin-api-key`，文件权限设置为 `0600`，所有者设为受控的 systemd 管理账户（通常为 `root:root`）。通过安全文件写入接口写入 API key，不得把 key 放在命令行、manifest 或日志中；向 2.1 的同一个 systemd 单元追加配置：
 
 ~~~ini
-[Service]
 LoadCredential=boom_gateway_admin_api_key:/etc/boom/credentials/gateway-admin-api-key
 Environment=VLLM_GATEWAY_ADMIN_USER_ID=admin
 ~~~
 
-脚本会从 systemd 提供的 `$CREDENTIALS_DIRECTORY/boom_gateway_admin_api_key` 读取管理员 API key。也可以使用 `VLLM_GATEWAY_ADMIN_API_KEY_FILE` 指向权限受限的凭据文件；仅在运行环境本身已提供安全注入时使用 `VLLM_GATEWAY_ADMIN_API_KEY`。这些变量都不得写入 monitor-manifest.json、incident 或普通日志。
+监控脚本只从 systemd 提供的 `$CREDENTIALS_DIRECTORY/boom_gateway_admin_api_key` 读取 API key。`VLLM_GATEWAY_ADMIN_USER_ID` 未设置时使用 `admin`。
 
 ## 3. 监控清单契约（monitor-manifest.json）
 
@@ -65,10 +74,10 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 {
   "schema_version": 1,
   "deployment_key": "deployment-20261029-001",
-  "deployment_dir": "/data/boom/deployment",
+  "deployment_dir": "/data/boom/deployment/deployment-20261029-001",
   "control_host": {
     "ssh_target": "control-host",
-    "deployment_dir": "/data/boom/deployment"
+    "deployment_dir": "/data/boom/deployment/deployment-20261029-001"
   },
   "agent_notify": {
     "transport": "http",
@@ -123,7 +132,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 
 ### 3.2 字段规则
 
-Gateway 增强是可选项。需要接入时，在上述清单顶层增加：
+接入boom Gateway 是可选项。需要接入时，在监控清单契约顶层增加：
 
 ~~~json
 {
@@ -145,7 +154,7 @@ Gateway 增强是可选项。需要接入时，在上述清单顶层增加：
 
 - schema_version：清单格式版本；
 - deployment_key：本次部署的稳定标识，用于把事件路由到当前 Pi 会话；
-- deployment_dir：控制宿主机上的部署目录；
+- deployment_dir：控制宿主机上当前模型服务部署的独立目录；多个可独立恢复的模型服务部署不得共用该目录，避免 monitor-state.json 和 events 相互覆盖；
 - control_host.ssh_target：Agent 从 Pi 容器通过 SSH 读取事件和部署资料时使用的目标；
 - agent_notify.endpoint：监控进程向 Pi Extension 上报事件的 HTTP 地址，必须是监控进程可送达的地址：监控与 Pi 同机时为本机回环；不同机时，由 Pi 所在机器通过 SSH 反向隧道把 Extension 的监听端口落到控制宿主机回环（endpoint 仍为回环形态），或在防火墙白名单限制下直连 Pi 所在机器。Extension 的监听地址和端口由环境变量 VLLM_FAULT_NOTIFY_HOST（默认 127.0.0.1）和 VLLM_FAULT_NOTIFY_PORT（默认 8765）控制；通知接口无认证，除上述形态外不得暴露到网络；
 - probe_timeout_seconds：单次 SSH 或检查命令的最长等待时间；
@@ -154,7 +163,6 @@ Gateway 增强是可选项。需要接入时，在上述清单顶层增加：
 - `gateway.base_url` 是控制宿主机可访问的 Boom Gateway origin，只允许不含路径、用户名、密码、查询参数和 fragment 的绝对 HTTP(S) 地址；
 - `gateway.poll_interval_seconds` 控制 `/dashboard/api/admin/models` 的轮询周期，`gateway.request_timeout_seconds` 控制单次管理请求等待时间，两者都必须大于 0；
 - `gateway.deployments` 使用 `gateway_deployment_id` 将 Gateway deployment 精确映射到现有 `service_id`；配置的 `recovery_group` 必须与该服务自身恢复组一致。不得只用 `model_name` 映射；
-- Gateway 管理员凭据只从 `VLLM_GATEWAY_ADMIN_API_KEY`、`VLLM_GATEWAY_ADMIN_API_KEY_FILE` 或 systemd credential `boom_gateway_admin_api_key` 读取；管理员 ID 使用 `VLLM_GATEWAY_ADMIN_USER_ID`，默认 `admin`；
 - services：本次部署中需要持续观察的服务；
 - service_id：服务稳定标识；
 - role：服务角色，例如 master、worker、prefill、decode、proxy 或 mooncake；
@@ -206,7 +214,7 @@ Gateway 登录、超时、响应格式、deployment 缺失或映射异常连续�
 事件文件由监控进程创建，并可能在 Agent 处理期间继续追加观测证据。Agent 必须遵守以下写入边界：
 
 - 将事件中由监控进程生成的标识、信号、观测和证据字段视为只读，不得删除或覆盖；
-- Agent开始处理时将 `status` 改为 `processing`，并只补充`diagnosis`（故障判断及依据：结论、指向本事件 `evidence` 条目的证据引用、排除的假设）、`recovery`（恢复执行记录：选择的恢复策略与范围、实际执行的动作、SSH/Docker 操作及结果、是否使用备用节点）和 `validation`（验收记录：readiness、通信、模型身份和真实 completion 的逐项验收结果）；
+- Agent开始处理时将 `status` 改为 `processing`，并只补充`diagnosis`（故障判断及依据：结论、指向本事件 `evidence` 条目的证据引用、排除的假设）、`recovery`（恢复执行记录：选择的恢复策略与范围、尝试次数、实际执行的动作、SSH/Docker 操作及结果、是否使用备用节点）和 `validation`（验收记录：readiness、通信、模型身份和真实 completion 的逐项验收结果）；
 - 每次写回前重新读取最新事件，合并并保留监控进程已经追加的字段和证据；
 - 完成验收后将 `status` 改为 `recovered`、`recovered_degraded`、`failed` 或 `waiting_for_user`。仍需用户处理的事项写入 `diagnosis`；`failed` 和 `waiting_for_user` 表示故障尚未解决，同组同类事件继续追加证据；状态为 `recovered` 或 `recovered_degraded` 后，该类故障再次出现时会新建事件。
 
@@ -228,6 +236,8 @@ Gateway 登录、超时、响应格式、deployment 缺失或映射异常连续�
 | 命令、脚本、配置、镜像或模型错误 | 命令参数互斥、脚本缺陷、挂载或端口配置错误、镜像 digest 不一致或模型加载失败 | 能按第 5.1.2 节就地修正时，先修正再恢复 | 正确修正方案无法核实或需要变更用户确认的部署方案时，停止自动重试并报告 |
 | 资源耗尽 | OOM 证据、显存/内存分配失败或句柄耗尽的日志报错；资源水位本身无信号，依据后果和日志判定 | 可清理本次残留后按原配置重试一次 | 不得自动缩小并行规模；仍不足则迁移或报告失败 |
 
+同一未解决事件中，同一恢复组、同一故障类型下的同一恢复方案最多自动尝试 2 次。每次尝试都必须在 `recovery` 中记录方案、尝试次数、实际动作和验收结果；第 2 次仍未通过验收，或动作执行后服务从未就绪时，不得继续重复该方案，必须按上表升级到重建、恢复组处理、迁移或其他适用路径。没有有依据且可自主执行的后续方案时，将事件置为 `waiting_for_user` 并报告证据和结论。若先修正了 Agent 生成的命令、脚本或配置，修正后的动作属于新的恢复方案，重新按该方案计数。
+
 Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原拓扑来伪造成功；只有满足第 5.3 节前置判定和执行约束的降级恢复可以改变拓扑，且终态必须为 recovered_degraded。
 
 ### 5.1 原地恢复
@@ -242,7 +252,7 @@ Agent 不能因为恢复失败而缩卡、改单机、删除 rank 或修改原�
 
 #### 5.1.1 可按原配置直接重启或重建
 
-确认已验收的配置和启动命令仍然适用，且故障出在运行实例时，Agent 按 `deployment_report.json` 和 `commands.log` 记录的镜像、设备、挂载、环境和启动参数重启或重建受影响的服务，再按第 4 章验收。`monitor-manifest.json` 仅提供监控所需的服务与检查命令。
+确认已验收的配置和启动命令仍然适用，且故障出在运行中的服务组件时，Agent 按 `deployment_report.json` 和 `commands.log` 记录的镜像、设备、挂载、环境和启动参数重启或重建受影响的服务，再按第 4 章验收。`monitor-manifest.json` 仅提供监控所需的服务与检查命令。
 
 #### 5.1.2 需先修正再恢复
 

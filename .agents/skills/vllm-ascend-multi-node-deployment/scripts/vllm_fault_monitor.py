@@ -41,8 +41,6 @@ GATEWAY_AUTO_DISABLED = "gateway_auto_disabled"
 GATEWAY_ERROR_CONFIRMATIONS = 3
 GATEWAY_MODELS_EVENT = "gateway_models"
 GATEWAY_ERROR_EVENT = "gateway_error"
-GATEWAY_API_KEY_ENV = "VLLM_GATEWAY_ADMIN_API_KEY"
-GATEWAY_API_KEY_FILE_ENV = "VLLM_GATEWAY_ADMIN_API_KEY_FILE"
 GATEWAY_USER_ID_ENV = "VLLM_GATEWAY_ADMIN_USER_ID"
 GATEWAY_CREDENTIAL_NAME = "boom_gateway_admin_api_key"
 PROBE_EXECUTION_ERROR_KINDS = {
@@ -313,18 +311,12 @@ def _safe_url(value: Any) -> str:
 
 
 def _gateway_api_key() -> str | None:
-    direct = os.environ.get(GATEWAY_API_KEY_ENV)
-    if direct:
-        return direct
-    path_value = os.environ.get(GATEWAY_API_KEY_FILE_ENV)
-    if not path_value:
-        credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
-        if credential_dir:
-            path_value = str(Path(credential_dir) / GATEWAY_CREDENTIAL_NAME)
-    if not path_value:
+    credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not credential_dir:
         return None
+    path_value = Path(credential_dir) / GATEWAY_CREDENTIAL_NAME
     try:
-        value = Path(path_value).read_text(encoding="utf-8").strip()
+        value = path_value.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise GatewayClientError(
             "gateway_config_error", "Gateway administrator credential file is unavailable"
@@ -405,7 +397,8 @@ class GatewayClient:
         if not api_key:
             raise GatewayClientError(
                 "gateway_config_error",
-                f"Gateway administrator credential is not configured in {GATEWAY_API_KEY_ENV}",
+                "Gateway administrator credential is not configured via systemd credential "
+                f"{GATEWAY_CREDENTIAL_NAME}",
             )
         user_id = os.environ.get(GATEWAY_USER_ID_ENV, "admin")
         self._request_json(
