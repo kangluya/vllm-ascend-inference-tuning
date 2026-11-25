@@ -170,8 +170,8 @@ async function handleFaultEvent(
 
 function startServer(pi: ExtensionAPI): void {
 	if (server) return;
-	const host = process.env.VLLM_FAULT_NOTIFY_HOST ?? "127.0.0.1";
-	const port = Number(process.env.VLLM_FAULT_NOTIFY_PORT ?? "8765");
+	const host = "0.0.0.0";
+	const port = 8765;
 	const candidate = createServer((request, response) => {
 		if (request.method === "GET" && request.url === "/health") {
 			sendJson(response, 200, {

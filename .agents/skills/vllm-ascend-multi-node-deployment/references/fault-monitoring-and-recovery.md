@@ -26,7 +26,7 @@
 存在多个能够独立停止、重建和验收的模型服务部署时，对每个模型服务部署分别执行以下步骤。每个模型服务部署使用独立的 `deployment_key`、部署目录、monitor-manifest.json 和 systemd 单元；同一模型服务部署内部必须共同恢复的 Master/Worker 或 Prefill/Decode/Proxy/Mooncake 作为服务组件继续放在同一份清单的 `services` 数组中。多个模型服务部署可以运行在同一台控制宿主机并共享监控脚本、Pi 通知地址和 Gateway 管理凭据，但 monitor-state.json、events、deployment_report.json 和 commands.log 必须按 deployment_key 隔离。
 
 1. 生成 monitor-manifest.json，包含 deployment_key、control_host、监控进程可送达的 agent_notify endpoint（字段规则见第 3.2 节）、探测周期，以及每个服务的节点、容器、recovery_group、基于实机进程身份生成的必填容器内进程检查命令、readiness、NPU 和可选日志/业务探针命令；需要接入 Gateway 时，额外配置第 3.2 节的可选 `gateway` 映射，不删除或关闭原有服务探针；端口、设备、挂载、环境变量和完整部署命令继续记录在 deployment_report.json 与 commands.log；monitor-manifest.json 的字段契约见本文件第 3 章；
-2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；从控制宿主机侧请求 agent_notify 端点的健康检查接口（同机时即本地请求；不同机时通过 SSH 在控制宿主机上请求）确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功；确认失败时停止流程，不得启动监控单元；
+2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；从控制宿主机直接请求 agent_notify 端点的健康检查接口确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功。默认使用控制宿主机到 Pi 所在机器的 HTTP 直连；只有直连不可达时才使用 Pi 主动建立的 SSH 反向隧道作为备用；确认失败时停止流程，不得启动监控单元；
 3. 配置接入 boom Gateway 时，从控制宿主机验证 Gateway 管理地址可达、管理员认证有效，并通过 `/dashboard/api/admin/models` 确认每个 `gateway_deployment_id` 唯一存在且映射到正确的入口服务；认证信息必须通过第 2.2 节规定的 systemd credential 提供，不写入清单；验证失败时保留原有探针配置并停止 Gateway 的接入，不得带着错误映射启动；
 4. 将 Skill 中的 `scripts/vllm_fault_monitor.py` 通过 SSH 复制到控制宿主机的共享路径 `/data/boom/deployment/vllm_fault_monitor.py`，并设置为可执行；只有路由确认成功且脚本复制完成后，才能注册并启动本次部署的 systemd 监控单元；
 5. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
@@ -81,7 +81,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
   },
   "agent_notify": {
     "transport": "http",
-    "endpoint": "http://127.0.0.1:18765/v1/fault-events"
+    "endpoint": "http://<pi-host-ip>:8765/v1/fault-events"
   },
   "probe_timeout_seconds": 20,
   "probe_interval_seconds": 30,
@@ -156,7 +156,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 - deployment_key：本次部署的稳定标识，用于把事件路由到当前 Pi 会话；
 - deployment_dir：控制宿主机上当前模型服务部署的独立目录；多个可独立恢复的模型服务部署不得共用该目录，避免 monitor-state.json 和 events 相互覆盖；
 - control_host.ssh_target：Agent 从 Pi 容器通过 SSH 读取事件和部署资料时使用的目标；
-- agent_notify.endpoint：监控进程向 Pi Extension 上报事件的 HTTP 地址，必须是监控进程可送达的地址：监控与 Pi 同机时为本机回环；不同机时，由 Pi 所在机器通过 SSH 反向隧道把 Extension 的监听端口落到控制宿主机回环（endpoint 仍为回环形态），或在防火墙白名单限制下直连 Pi 所在机器。Extension 的监听地址和端口由环境变量 VLLM_FAULT_NOTIFY_HOST（默认 127.0.0.1）和 VLLM_FAULT_NOTIFY_PORT（默认 8765）控制；通知接口无认证，除上述形态外不得暴露到网络；
+- agent_notify.endpoint：监控进程向 Pi Extension 上报事件的 HTTP 地址，必须是监控进程可送达的地址。Pi Extension 在 Pi 会话期间固定监听 `0.0.0.0:8765`；清单默认使用控制宿主机可达的 Pi 所在机器实际 IP，例如 `http://192.168.1.100:8765/v1/fault-events`，不得把监听地址 `0.0.0.0` 写入 endpoint。直连不可达时，才使用 Pi 主动建立的 SSH 反向隧道，并把 endpoint 配置为控制宿主机上的隧道落点。通知接口无认证，只适用于受控网络，不得暴露到公网或其他不受信任网络；
 - probe_timeout_seconds：单次 SSH 或检查命令的最长等待时间；
 - `probe_interval_seconds` 控制全量巡检周期。Docker 事件触发对应服务的额外检查；
 - `gateway` 是可选增强配置；省略或将 `gateway.enabled` 设为 `false` 时，监控完全按原有内部探针运行；启用后也不会停止任何现有探针；
@@ -180,7 +180,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 
 ### 3.3 清单变更与安全边界
 
-清单生成后，部署拓扑、容器、端口、设备、Gateway deployment 映射或原始启动命令发生变化时必须重新生成清单并重启监控。监控进程只读清单，不在运行期间修改清单。命令字段只保存经过部署验收或已部署完成的服务提供的确认的检查命令。命令结果、凭据和完整日志写入部署运行目录或脱敏日志，不写入清单；Gateway 返回的 `api_base` 写入事件前会移除用户信息、查询参数和 fragment。Pi Extension 只在本机回环端口接收事件，并继续校验已登记的 deployment_key、incident_id 和事件路径；不得把该端口发布到外部网络。
+清单生成后，部署拓扑、容器、端口、设备、Gateway deployment 映射或原始启动命令发生变化时必须重新生成清单并重启监控。监控进程只读清单，不在运行期间修改清单。命令字段只保存经过部署验收或已部署完成的服务提供的确认的检查命令。命令结果、凭据和完整日志写入部署运行目录或脱敏日志，不写入清单；Gateway 返回的 `api_base` 写入事件前会移除用户信息、查询参数和 fragment。Pi Extension 默认在 Pi 会话期间监听 `0.0.0.0:8765`，并继续校验已登记的 deployment_key、incident_id 和事件路径；由于通知接口无认证，只允许在控制服务器可达的受控网络中使用，不得暴露到公网或其他不受信任网络。Pi 会话关闭时释放监听端口。
 
 ## 4. 故障事件处理
 
