@@ -29,7 +29,7 @@
 2. 调用 Pi Extension 的 vllm_fault_register_deployment 注册 deployment_key 到当前 Pi 会话；从控制宿主机直接请求 agent_notify 端点的健康检查接口确认路由已生效，`deployment_keys` 已包含本 deployment_key 才算确认成功。默认使用控制宿主机到 Pi 所在机器的 HTTP 直连；只有直连不可达时才使用 Pi 主动建立的 SSH 反向隧道作为备用；确认失败时停止流程，不得启动监控单元；
 3. 配置接入 boom Gateway 时，从控制宿主机验证 Gateway 管理地址可达、管理员认证有效，并通过 `/dashboard/api/admin/models` 确认每个 `gateway_deployment_id` 唯一存在且映射到正确的入口服务；认证信息必须通过第 2.2 节规定的 systemd credential 提供，不写入清单；验证失败时保留原有探针配置并停止 Gateway 的接入，不得带着错误映射启动；
 4. 将 Skill 中的 `scripts/vllm_fault_monitor.py` 通过 SSH 复制到控制宿主机的共享路径 `/data/boom/deployment/vllm_fault_monitor.py`，并设置为可执行；只有路由确认成功且脚本复制完成后，才能注册并启动本次部署的 systemd 监控单元；
-5. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key 和清单路径写入 monitor-state.json；Agent 只读取并校验这些字段；
+5. 监控进程启动后自行将 PID、PGID、启动时间、命令摘要、deployment_key、清单路径和巡检心跳写入 monitor-state.json；每轮全量巡检开始和结束时各原子更新一次，Agent 只读取并校验这些字段；
 6. 监控进程通过 HTTP 向 Pi Extension 的 /v1/fault-events 上报事件。
 
 ## 2. systemd 监控单元
@@ -158,7 +158,7 @@ monitor-manifest.json 是部署完成后生成的部署事实输入，供监控�
 - control_host.ssh_target：Agent 从 Pi 容器通过 SSH 读取事件和部署资料时使用的目标；
 - agent_notify.endpoint：监控进程向 Pi Extension 上报事件的 HTTP 地址，必须是监控进程可送达的地址。Pi Extension 在 Pi 会话期间固定监听 `0.0.0.0:8765`；清单默认使用控制宿主机可达的 Pi 所在机器实际 IP，例如 `http://192.168.1.100:8765/v1/fault-events`，不得把监听地址 `0.0.0.0` 写入 endpoint。直连不可达时，才使用 Pi 主动建立的 SSH 反向隧道，并把 endpoint 配置为控制宿主机上的隧道落点。通知接口无认证，只适用于受控网络，不得暴露到公网或其他不受信任网络；
 - probe_timeout_seconds：单次 SSH 或检查命令的最长等待时间；
-- `probe_interval_seconds` 控制全量巡检周期。Docker 事件触发对应服务的额外检查；
+- `probe_interval_seconds` 控制全量巡检周期。；
 - `gateway` 是可选增强配置；省略或将 `gateway.enabled` 设为 `false` 时，监控完全按原有内部探针运行；启用后也不会停止任何现有探针；
 - `gateway.base_url` 是控制宿主机可访问的 Boom Gateway origin，只允许不含路径、用户名、密码、查询参数和 fragment 的绝对 HTTP(S) 地址；
 - `gateway.poll_interval_seconds` 控制 `/dashboard/api/admin/models` 的轮询周期，`gateway.request_timeout_seconds` 控制单次管理请求等待时间，两者都必须大于 0；

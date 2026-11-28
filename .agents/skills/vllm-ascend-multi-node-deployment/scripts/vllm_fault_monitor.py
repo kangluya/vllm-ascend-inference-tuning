@@ -909,75 +909,6 @@ def build_gateway_incident(
     return incident
 
 
-class DockerEventWatcher(threading.Thread):
-    def __init__(
-        self,
-        host: str,
-        containers: Sequence[str],
-        events: queue.Queue[dict[str, Any]],
-        stop_event: threading.Event,
-    ) -> None:
-        super().__init__(name=f"docker-events-{host}", daemon=True)
-        self.host = host
-        self.containers = list(containers)
-        self.events = events
-        self.stop_event = stop_event
-
-    def run(self) -> None:
-        backoff = 1.0
-        filters = " ".join(
-            f"--filter {shlex.quote('container=' + container)}"
-            for container in self.containers
-        )
-        command = [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-            self.host,
-            "docker events --format '{{json .}}' "
-            "--filter type=container "
-            "--filter event=die "
-            "--filter event=oom "
-            "--filter event=health_status "
-            + filters,
-        ]
-        while not self.stop_event.is_set():
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-                assert process.stdout is not None
-                for line in process.stdout:
-                    if self.stop_event.is_set():
-                        break
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    payload["host"] = self.host
-                    self.events.put(payload)
-                if self.stop_event.is_set():
-                    process.terminate()
-                    break
-                process.wait(timeout=2)
-                backoff = 1.0
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                LOGGER.warning("docker events watcher %s: %s", self.host, exc)
-            if self.stop_event.wait(backoff):
-                break
-            backoff = min(backoff * 2, 30.0)
-
-
 class GatewayWatcher(threading.Thread):
     def __init__(
         self,
@@ -1044,6 +975,15 @@ class Monitor:
         self.root = Path(str(self.manifest.get("deployment_dir") or manifest_path.parent))
         self.events_dir = self.root / "events"
         self.state_path = self.root / "monitor-state.json"
+        state = read_json(self.state_path, {})
+        self.state = dict(state) if isinstance(state, dict) else {}
+        heartbeat_count = self.state.get("heartbeat_count", 0)
+        self.heartbeat_count = (
+            heartbeat_count
+            if isinstance(heartbeat_count, int) and heartbeat_count >= 0
+            else 0
+        )
+        self.current_status: str | None = None
         self.executor = RemoteExecutor(
             int(self.manifest.get("probe_timeout_seconds", 20))
         )
@@ -1083,10 +1023,8 @@ class Monitor:
         return [item for item in values if isinstance(item, Mapping)]
 
     def write_state(self, status: str, **extra: Any) -> None:
-        state = read_json(self.state_path, {})
-        if not isinstance(state, dict):
-            state = {}
-        state.update(
+        self.current_status = status
+        self.state.update(
             {
                 "schema_version": 1,
                 "status": status,
@@ -1099,25 +1037,10 @@ class Monitor:
                 "updated_at": utc_now(),
             }
         )
-        state.update(extra)
-        atomic_write_json(self.state_path, state)
+        self.state.update(extra)
+        atomic_write_json(self.state_path, self.state)
 
     def start_watchers(self) -> None:
-        by_host: dict[str, list[str]] = {}
-        for service in self.services:
-            host = _host(service)
-            container = str(service.get("container") or "")
-            if host and container:
-                by_host.setdefault(host, []).append(container)
-        for host, containers in by_host.items():
-            watcher = DockerEventWatcher(
-                host,
-                sorted(set(containers)),
-                self.probe_events,
-                self.stop_event,
-            )
-            self.watchers.append(watcher)
-            watcher.start()
         gateway = self.gateway_config
         if gateway is not None:
             watcher = GatewayWatcher(
@@ -1136,12 +1059,6 @@ class Monitor:
         self.stop_event.set()
         for watcher in self.watchers:
             watcher.join(timeout=2)
-
-    def find_service(self, host: str, container: str) -> Mapping[str, Any] | None:
-        for service in self.services:
-            if _host(service) == host and str(service.get("container")) == container:
-                return service
-        return None
 
     def find_service_by_id(self, service_id: str) -> Mapping[str, Any] | None:
         for service in self.services:
@@ -1460,7 +1377,9 @@ class Monitor:
             if streak[0] >= UNKNOWN_PROBE_CONFIRMATIONS
         }
 
-    def probe(self, service: Mapping[str, Any], trigger: Mapping[str, Any] | None) -> None:
+    def probe(
+        self, service: Mapping[str, Any], trigger: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
         observation, evidence = _service_probe(self.executor, service)
         observed_signals = _signals(observation)
         signals, confirmation_count, first_failed_at = self.confirm_signals(
@@ -1488,6 +1407,17 @@ class Monitor:
                 max((count for count, _ in unknown_probes.values()), default=1),
                 min((first_seen for _, first_seen in unknown_probes.values()), default=None),
             )
+        return {
+            "service_id": str(
+                service.get("service_id") or service.get("container") or "unknown"
+            ),
+            "signals": sorted(set(observed_signals)),
+            "inconclusive_probes": sorted(
+                name
+                for name, detail in observation.get("probe_results", {}).items()
+                if detail.get("outcome") == "unknown"
+            ),
+        }
 
     def _record_incident(
         self,
@@ -1545,9 +1475,62 @@ class Monitor:
         LOGGER.warning("incident detected: %s %s", service_id, signals)
 
     def probe_all(self) -> None:
-        for service in self.services:
-            if not self.stop_event.is_set():
-                self.probe(service, None)
+        services = self.services
+        sequence = self.heartbeat_count + 1
+        started_at = utc_now()
+        started = time.monotonic()
+        track_state = self.current_status is not None
+        if track_state:
+            self.write_state(
+                self.current_status,
+                heartbeat_count=self.heartbeat_count,
+                probe_round={
+                    "sequence": sequence,
+                    "status": "running",
+                    "started_at": started_at,
+                    "completed_at": None,
+                    "duration_ms": None,
+                    "service_count": len(services),
+                    "problem_services": [],
+                },
+            )
+
+        problem_services: list[dict[str, Any]] = []
+        completed_services = 0
+        round_status = "completed"
+        try:
+            for service in services:
+                if self.stop_event.is_set():
+                    round_status = "interrupted"
+                    break
+                result = self.probe(service, None)
+                completed_services += 1
+                if result["signals"] or result["inconclusive_probes"]:
+                    problem_services.append(result)
+        except Exception:
+            round_status = "failed"
+            raise
+        finally:
+            completed_at = utc_now() if round_status == "completed" else None
+            if round_status == "completed":
+                self.heartbeat_count = sequence
+            if track_state:
+                extra: dict[str, Any] = {
+                    "heartbeat_count": self.heartbeat_count,
+                    "probe_round": {
+                        "sequence": sequence,
+                        "status": round_status,
+                        "started_at": started_at,
+                        "completed_at": completed_at,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "service_count": len(services),
+                        "completed_services": completed_services,
+                        "problem_services": problem_services,
+                    },
+                }
+                if completed_at is not None:
+                    extra["last_probe_completed_at"] = completed_at
+                self.write_state(self.current_status, **extra)
 
     def handle_runtime_event(self, event: Mapping[str, Any]) -> None:
         event_type = event.get("monitor_event_type")
@@ -1556,13 +1539,6 @@ class Monitor:
             return
         if event_type == GATEWAY_ERROR_EVENT:
             self.handle_gateway_error(event)
-            return
-        service = self.find_service(
-            str(event.get("host") or ""),
-            str(event.get("container") or event.get("Actor", {}).get("Attributes", {}).get("name", "")),
-        )
-        if service is not None:
-            self.probe(service, event)
 
     def _report_loop(self) -> None:
         notify = self.manifest.get("agent_notify", {})

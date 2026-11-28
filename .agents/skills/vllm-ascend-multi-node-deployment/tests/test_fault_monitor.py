@@ -170,11 +170,8 @@ class FaultProbeTests(unittest.TestCase):
                 monitor.executor = Mock(spec=RemoteExecutor)
                 monitor.executor.run.side_effect = [
                     CommandResult(0, "running\tfalse\t0", ""), failure
-                ] * 6
-                event = {"host": "node-a", "container": "decode-0"}
+                ] * 4
                 monitor.probe_all()
-                monitor.handle_runtime_event(event)
-                monitor.handle_runtime_event(event)
                 monitor.probe_all()
                 self.assertTrue(monitor.report_queue.empty())
 
@@ -195,7 +192,7 @@ class FaultProbeTests(unittest.TestCase):
                 self.assertTrue(monitor.report_queue.empty())
                 self.assertEqual(read_json(event_path, {})["confirmation_count"], 4)
 
-    def test_unknown_streaks_reset_on_conclusive_results_and_skipped_periodic_checks(self) -> None:
+    def test_unknown_streaks_reset_on_conclusive_results_and_skipped_probes(self) -> None:
         unknown = {"outcome": "unknown", "kind": "command_timeout"}
         ok = {"outcome": "ok", "kind": "ok"}
         failed_process = {"probe_results": {"process": unknown}}
@@ -218,15 +215,13 @@ class FaultProbeTests(unittest.TestCase):
             path = Path(directory) / "monitor-manifest.json"
             atomic_write_json(path, {"services": [self.service()]})
             monitor = Monitor(path)
-            event = {"host": "node-a", "container": "decode-0"}
             with patch(
                 "scripts.vllm_fault_monitor._service_probe",
                 side_effect=[(observation, []) for observation in rounds],
             ):
-                for _ in range(7):
+                for _ in range(8):
                     monitor.probe_all()
                     self.assertTrue(monitor.report_queue.empty())
-                monitor.handle_runtime_event(event)
                 for _ in range(2):
                     monitor.probe_all()
                     self.assertTrue(monitor.report_queue.empty())
@@ -290,7 +285,7 @@ class FaultProbeTests(unittest.TestCase):
                 CommandResult(7, "", "connection refused"),
             ] * 3
             monitor.executor = executor
-            monitor.probe(service, {"Action": "oom"})
+            monitor.probe(service, None)
             event_path = monitor.report_queue.get_nowait()
             first = read_json(event_path, {})
             self.assertEqual(first["signals"], ["container_exited", "oom_killed"])
@@ -306,38 +301,33 @@ class FaultProbeTests(unittest.TestCase):
 
 
 class FaultMonitorTests(unittest.TestCase):
-    def test_full_probe_runs_when_docker_events_keep_arriving(self) -> None:
+    def test_probe_round_writes_start_and_completion_heartbeat(self) -> None:
+        service = {
+            "service_id": "decode-0",
+            "container": "decode-0",
+            "process_check_command": ["docker", "exec", "decode-0", "true"],
+        }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "monitor-manifest.json"
-            atomic_write_json(path, {"services": [], "probe_interval_seconds": 30})
+            atomic_write_json(path, {"services": [service]})
             monitor = Monitor(path)
+            monitor.current_status = "running"
             monitor.write_state = Mock()
-            monitor.reporter = Mock()
-            monitor.start_watchers = Mock()
-            monitor.handle_runtime_event = Mock()
-            clock = 0
-            timeouts = []
+            monitor.probe = Mock(
+                return_value={
+                    "service_id": "decode-0",
+                    "signals": [],
+                    "inconclusive_probes": [],
+                }
+            )
+            monitor.probe_all()
 
-            def next_event(timeout):
-                nonlocal clock
-                timeouts.append(timeout)
-                self.assertLessEqual(len(timeouts), 3, "periodic sweep was delayed by events")
-                clock += 10
-                return {"container": "decode-0"}
-
-            monitor.probe_events = Mock()
-            monitor.probe_events.get.side_effect = next_event
-
-            def full_probe():
-                if clock >= 30:
-                    monitor.stop_event.set()
-
-            monitor.probe_all = Mock(side_effect=full_probe)
-            with patch("scripts.vllm_fault_monitor.time.monotonic", side_effect=lambda: clock):
-                self.assertEqual(monitor.run(), 0)
-            self.assertEqual(timeouts, [30, 20, 10])
-            self.assertEqual(monitor.handle_runtime_event.call_count, 3)
-            self.assertEqual(monitor.probe_all.call_count, 2)
+            self.assertEqual(monitor.write_state.call_count, 2)
+            started = monitor.write_state.call_args_list[0].kwargs
+            completed = monitor.write_state.call_args_list[1].kwargs
+            self.assertEqual(started["probe_round"]["status"], "running")
+            self.assertEqual(completed["heartbeat_count"], 1)
+            self.assertEqual(completed["probe_round"]["status"], "completed")
 
     def test_npu_health_parser(self) -> None:
         self.assertTrue(npu_health_ok("Health : OK\n", 0))
@@ -738,18 +728,6 @@ class GatewayIntegrationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "credentials"):
             validate_manifest(manifest)
-
-    def test_start_watchers_keeps_docker_watcher_and_adds_gateway_watcher(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            monitor = self.make_monitor(directory)
-            with patch("scripts.vllm_fault_monitor.DockerEventWatcher") as docker_watcher, patch(
-                "scripts.vllm_fault_monitor.GatewayWatcher"
-            ) as gateway_watcher:
-                monitor.start_watchers()
-            docker_watcher.assert_called_once()
-            gateway_watcher.assert_called_once()
-            docker_watcher.return_value.start.assert_called_once()
-            gateway_watcher.return_value.start.assert_called_once()
 
     def test_auto_disabled_creates_one_deduplicated_gateway_incident(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
